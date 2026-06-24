@@ -1,0 +1,27 @@
+[package]
+name = "vsocktun"
+version = "0.1.0"
+edition = "2024"
+authors = ["Zama"]
+license = "BSD-3-Clause-Clear"
+repository = "https://github.com/zama-ai/vsocktun"
+description = "Multi-queue TUN to VSOCK relay for AWS Nitro enclaves."
+publish = true
+
+[dependencies]
+anyhow = "=1.0.100"  # Error handling - MEDIUM RISK: Reputable individual maintainer (dtolnay), 410M downloads
+bytemuck = { version = "=1.23.2", features = ["derive"] }  # Byte casting and plain-old-data derives - LOW RISK: Lokathor + community maintainers, widely used for zero-copy layout validation; used here only for fixed wire headers while preserving explicit endian conversion
+ciborium = "0.2.2" # CBOR support for serde - LOW RISK: Enarx team, 100M+ downloads
+clap = { version = "=4.5.47", features = ["derive"] }  # CLI argument parsing - LOW RISK: clap-rs team
+route_manager = { version = "=0.2.11" }  # MEDIUM RISK: small focused networking crate already pulled transitively by tun-rs; used directly by vsocktun to install enclave routes without depending on extra runtime binaries in the enclave image
+tokio = { version = "=1.52.3", features = ["full"] }  # Async runtime - LOW RISK: tokio team, industry standard
+tokio-vsock = "=0.7.2"  # Async virtio socket support - MEDIUM RISK: same rust-vsock org/owners as vsock, 5M+ downloads
+tracing = { version = "=0.1.44", features = ["log"] }  # Application instrumentation - LOW RISK: tokio-rs team
+tracing-subscriber = { version = "=0.3.22", features = ["fmt", "std"] }  # Tracing subscriber - LOW RISK: tokio-rs team
+tun-rs = { version = "=2.8.3", features = ["async_tokio"] }  # Cross-platform TUN/TAP library - MEDIUM RISK: tun-rs team
+
+[dev-dependencies]
+etherparse = "=0.20.1"  # HIGH RISK: Individual maintainer (JulianSchmid), but focused, well-documented, and added as a test-only dependency so vsocktun can parse captured IPv4/UDP packets without bespoke header decoding
+netns-rs = "=0.2.0"  # Linux network namespaces - MEDIUM RISK: openanolis/dragonball + individual maintainer, small focused crate; used by vsocktun test code to create, enter, and clean up named netns without bespoke mount/setns lifecycle logic
+nix = { version = "=0.30.1", features = ["socket"] }  # Unix/POSIX bindings - LOW RISK: nix-rust project, widely used; used by vsocktun test code for standard Linux socket options
+tempfile = "=3.20.0"  # Temporary file handling - MEDIUM RISK: Individual maintainers (Stebalien, KodrAus), 345M+ downloads, test-only dependency
