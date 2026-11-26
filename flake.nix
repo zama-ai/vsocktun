@@ -78,9 +78,18 @@
                 extensions = [
                   "rustfmt"
                   "clippy"
+                  "rust-analyzer"
                 ];
               })
+              pkgs.stdenv.cc
+              pkgs.iproute2
+              pkgs.util-linux
+              pkgs.strace
             ];
+            shellHook = ''
+              echo "vsocktun dev shell: $(rustc --version)"
+              echo "The end-to-end tests are #[ignore]d; they need root, /dev/net/tun, VSOCK loopback, and iproute2."
+            '';
           };
         }
       );

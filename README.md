@@ -131,6 +131,23 @@ Enclave-only:
 - The parent-side runtime still needs `dnsproxy` (or equivalent) configured
   outside `vsocktun`.
 
+## Development
+
+The repository includes a Nix flake with a self-contained development shell:
+
+```sh
+nix develop
+cargo test
+cargo clippy --all-targets
+```
+
+The shell provides the pinned Rust toolchain, `rustfmt`, `clippy`,
+`rust-analyzer`, the C linker, `iproute2`, and `strace`. `nix build`
+builds the release binary with the same toolchain.
+
+The end-to-end tests are marked `#[ignore]` because they need root,
+`/dev/net/tun`, VSOCK loopback support, and `iproute2`.
+
 ## Debugging
 
 When traffic does not appear to flow through the tunnel:
