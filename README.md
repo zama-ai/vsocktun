@@ -162,13 +162,12 @@ repositories such as KMS:
   path when the build environment can reach a Docker socket
 - `lib.<system>.enclave.mkLauncherImage` builds a parent-side image containing
   nitro-cli, vsocktun, the parent networking tools, and an embedded EIF
+- `lib.<system>.enclave.mkLauncherCommand` wraps that builder as an `nix run`
+  command for a consumer flake and an EIF directory
 
 A service repository supplies its application image, entrypoint, and EIF; this
 flake supplies the kernel, bootstrap, LinuxKit, nitro-cli, vsocktun, and the
 image templates.
-
-`nix flake check` builds a launcher image with a placeholder EIF and verifies
-that the tools and EIF path are present.
 
 ## Debugging
 
