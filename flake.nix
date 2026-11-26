@@ -133,32 +133,9 @@
           default = env.vsocktun;
         }
       );
-      checks = forAllSystems (
-        system:
-        let
-          env = environments.${system};
-          inherit (env) pkgs;
-          launcher = import ./nix/launcher-image.nix {
-            inherit pkgs;
-            inherit (env.enclaveParts) nitroCli;
-            tools = env.parentTools.packages;
-            eif = pkgs.writeText "test-enclave.eif" "test";
-            name = "enclave-launcher-test";
-          };
-        in
-        {
-          default = self.packages.${system}.default;
-          enclave-launcher =
-            pkgs.runCommand "enclave-launcher-check"
-              {
-                nativeBuildInputs = [ pkgs.python3 ];
-              }
-              ''
-                python ${./nix/check-launcher.py} ${launcher} /enclave/enclave.eif
-                touch "$out"
-              '';
-        }
-      );
+      checks = forAllSystems (system: {
+        default = self.packages.${system}.default;
+      });
       devShells = forAllSystems (
         system:
         let

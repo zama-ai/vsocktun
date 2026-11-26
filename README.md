@@ -167,9 +167,6 @@ A service repository supplies its application image, entrypoint, and EIF; this
 flake supplies the kernel, bootstrap, LinuxKit, nitro-cli, vsocktun, and the
 image templates.
 
-`nix flake check` builds a launcher image with a placeholder EIF and verifies
-that the tools and EIF path are present.
-
 ## Debugging
 
 When traffic does not appear to flow through the tunnel:
