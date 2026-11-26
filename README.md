@@ -148,6 +148,28 @@ builds the release binary with the same toolchain.
 The end-to-end tests are marked `#[ignore]` because they need root,
 `/dev/net/tun`, VSOCK loopback support, and `iproute2`.
 
+## Enclave image builders
+
+The flake also provides the generic Nitro enclave plumbing used by service
+repositories such as KMS:
+
+- `packages.<system>.nitro-cli`, `enclave-kernel`, `enclave-bootstrap`,
+  `enclave-linuxkit`, and `enclave-parent-tools`
+- `lib.<system>.enclave.mkRuntimeImage` adds vsocktun and an entrypoint to an
+  application image, producing the image that becomes the EIF
+- `lib.<system>.enclave.mkEifCommand` builds an unsigned EIF from such an image
+  through the host Docker daemon; `mkEifDerivation` does the same as a store
+  path when the build environment can reach a Docker socket
+- `lib.<system>.enclave.mkLauncherImage` builds a parent-side image containing
+  nitro-cli, vsocktun, the parent networking tools, and an embedded EIF
+
+A service repository supplies its application image, entrypoint, and EIF; this
+flake supplies the kernel, bootstrap, LinuxKit, nitro-cli, vsocktun, and the
+image templates.
+
+`nix flake check` builds a launcher image with a placeholder EIF and verifies
+that the tools and EIF path are present.
+
 ## Debugging
 
 When traffic does not appear to flow through the tunnel:

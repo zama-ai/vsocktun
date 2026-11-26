@@ -36,9 +36,6 @@
             rustc = toolchain;
           };
           workspace = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-        in
-        {
-          inherit pkgs toolchain;
           vsocktun = rustPlatform.buildRustPackage {
             pname = "vsocktun";
             version = workspace.package.version;
@@ -55,17 +52,113 @@
               license = pkgs.lib.licenses.bsd3Clear;
             };
           };
+          enclaveParts = import ./nix/enclave.nix { inherit pkgs rustPlatform; };
+          parentTools = import ./nix/parent-tools.nix { inherit pkgs vsocktun; };
+          eif = import ./nix/eif.nix {
+            inherit pkgs;
+            inherit (enclaveParts)
+              nitroCli
+              linuxkit
+              kernel
+              init
+              kernelCmdline
+              ;
+          };
+        in
+        {
+          inherit
+            pkgs
+            toolchain
+            vsocktun
+            enclaveParts
+            parentTools
+            eif
+            ;
         }
       );
     in
     {
-      packages = forAllSystems (system: {
-        inherit (environments.${system}) vsocktun;
-        default = environments.${system}.vsocktun;
-      });
-      checks = forAllSystems (system: {
-        default = self.packages.${system}.default;
-      });
+      lib = forAllSystems (
+        system:
+        let
+          env = environments.${system};
+          inherit (env) pkgs;
+        in
+        {
+          enclave = {
+            inherit (env.enclaveParts)
+              nitroCli
+              linuxkit
+              kernel
+              ;
+            bootstrap = env.enclaveParts.init;
+            mkEifCommand = env.eif.mkCommand;
+            mkEifDerivation = env.eif.mkDerivation;
+            mkRuntimeImage =
+              args:
+              import ./nix/runtime-image.nix (
+                {
+                  inherit pkgs;
+                  inherit (env) vsocktun;
+                }
+                // args
+              );
+            mkLauncherImage =
+              args:
+              import ./nix/launcher-image.nix (
+                {
+                  inherit pkgs;
+                  inherit (env.enclaveParts) nitroCli;
+                  tools = env.parentTools.packages;
+                }
+                // args
+              );
+            parentTools = env.parentTools.env;
+            parentToolsPackages = env.parentTools.packages;
+          };
+        }
+      );
+      packages = forAllSystems (
+        system:
+        let
+          env = environments.${system};
+        in
+        {
+          inherit (env) vsocktun;
+          nitro-cli = env.enclaveParts.nitroCli;
+          enclave-kernel = env.enclaveParts.kernel;
+          enclave-bootstrap = env.enclaveParts.init;
+          enclave-linuxkit = env.enclaveParts.linuxkit;
+          enclave-parent-tools = env.parentTools.env;
+          default = env.vsocktun;
+        }
+      );
+      checks = forAllSystems (
+        system:
+        let
+          env = environments.${system};
+          inherit (env) pkgs;
+          launcher = import ./nix/launcher-image.nix {
+            inherit pkgs;
+            inherit (env.enclaveParts) nitroCli;
+            tools = env.parentTools.packages;
+            eif = pkgs.writeText "test-enclave.eif" "test";
+            name = "enclave-launcher-test";
+          };
+        in
+        {
+          default = self.packages.${system}.default;
+          enclave-launcher =
+            pkgs.runCommand "enclave-launcher-check"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+              }
+              ''
+                python ${./nix/check-launcher.py} ${launcher} /enclave/enclave.eif
+                touch "$out"
+              '';
+        }
+      );
       devShells = forAllSystems (
         system:
         let
