@@ -1,0 +1,22 @@
+Use the image epoch for build metadata and omit daemon-local inspection fields.
+These fields describe the Docker daemon's storage and tagging history, not the image.
+
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -123,1 +123,1 @@
+-    let build_info = generate_build_info!(&format!("{kernel_path}.config")).map_err(|e| {
++    let build_info = generate_build_info!(&format!("{kernel_path}.config"), chrono::DateTime::from_timestamp(1, 0)).map_err(|e| {
+--- a/enclave_build/src/lib.rs
++++ b/enclave_build/src/lib.rs
+@@ -149,1 +149,1 @@
+-        let docker_info = self
++        let mut docker_info = self
+@@ -184,1 +184,8 @@
++        // Keep image-content fields, not daemon storage IDs, tags, or sizes.
++        if let Some(fields) = docker_info.as_object_mut() {
++            fields.retain(|key, _| matches!(key.as_str(),
++                "Architecture" | "Os" | "Config" | "RootFS" | "Created" | "Author" | "Comment"
++            ));
++        }
++
+         let mut custom_info = json!(null);

@@ -1,0 +1,37 @@
+Allow source-built kernels with CONFIG_NSM=y to omit the loadable NSM module.
+LinuxKit's optional source file support omits nsm.ko when it is absent.
+
+--- a/enclave_build/src/lib.rs
++++ b/enclave_build/src/lib.rs
+@@ -85,2 +85,0 @@
+-        } else if !Path::new(&nsm_path).is_file() {
+-            return Err(Docker2EifError::NsmPathError);
+--- a/enclave_build/src/yaml_generator.rs
++++ b/enclave_build/src/yaml_generator.rs
+@@ -10,1 +10,1 @@
+-    files: (DirTemplate, FileTemplate, FileTemplate),
++    files: (DirTemplate, FileTemplate, NsmFileTemplate),
+@@ -35,0 +36,7 @@
++#[derive(Debug, Serialize, Deserialize)]
++struct NsmFileTemplate {
++    #[serde(flatten)]
++    file: FileTemplate,
++    optional: bool,
++}
++
+@@ -86,5 +94,8 @@
+-                FileTemplate {
+-                    path: String::from("nsm.ko"),
+-                    source: self.nsm_path.clone(),
+-                    mode: String::from("0755"),
++                NsmFileTemplate {
++                    file: FileTemplate {
++                        path: String::from("nsm.ko"),
++                        source: self.nsm_path.clone(),
++                        mode: String::from("0755"),
++                    },
++                    optional: true,
+                 },
+@@ -197,1 +208,2 @@
+              \n    mode: \"0755\"\
++             \n    optional: true\
