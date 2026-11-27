@@ -157,11 +157,10 @@ repositories such as KMS:
   `enclave-eif-build`, and `enclave-parent-tools`
 - `lib.<system>.enclave.mkRuntimeImage` adds vsocktun and an entrypoint to an
   application image, producing the image that becomes the EIF
-- `lib.<system>.enclave.mkEifCommand` unpacks the image tarball with
+- `lib.<system>.enclave.mkEifDerivation` unpacks the image tarball with
   `skopeo`/`umoci`, writes the bootstrap and customer initrds with `cpio`, and
   assembles the EIF with AWS's `eif_build`; no Docker daemon or external image
-  cache is involved. `mkEifDerivation` does the same as a pure, cacheable store
-  path
+  cache is involved. The EIF artifacts are available directly in the Nix store.
 - `lib.<system>.enclave.mkLauncherImage` builds a parent-side image containing
   nitro-cli, vsocktun, the parent networking tools, and an embedded EIF.
   Pass `eif = "${eifBuild}/enclave.eif";` to embed the output of

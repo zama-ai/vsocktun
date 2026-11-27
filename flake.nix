@@ -59,7 +59,7 @@
             inherit pkgs eifBuild;
             inherit (enclaveParts)
               kernel
-              init
+              bootstrap
               kernelCmdline
               ;
           };
@@ -89,10 +89,9 @@
             inherit (env.enclaveParts)
               nitroCli
               kernel
+              bootstrap
               ;
             inherit (env) eifBuild;
-            bootstrap = env.enclaveParts.init;
-            mkEifCommand = env.eif.mkCommand;
             mkEifDerivation = env.eif.mkDerivation;
             mkRuntimeImage =
               args:
@@ -127,7 +126,7 @@
           inherit (env) vsocktun;
           nitro-cli = env.enclaveParts.nitroCli;
           enclave-kernel = env.enclaveParts.kernel;
-          enclave-bootstrap = env.enclaveParts.init;
+          enclave-bootstrap = env.enclaveParts.bootstrap;
           enclave-eif-build = env.eifBuild;
           enclave-parent-tools = env.parentTools.env;
           default = env.vsocktun;

@@ -2,7 +2,7 @@
   pkgs,
   eifBuild,
   kernel,
-  init,
+  bootstrap,
   kernelCmdline,
 }:
 let
@@ -16,10 +16,7 @@ let
   # write the two initrds expected by the Nitro bootstrap init. Everything is
   # file-based, so this runs in the sandbox and is cached by Nix.
   initrds =
-    {
-      image,
-      nsmKo ? null,
-    }:
+    image:
     pkgs.runCommand "enclave-initrds"
       {
         nativeBuildInputs = [
@@ -54,10 +51,7 @@ let
           mkdir -p "$rootfs/$directory"
         done
 
-        install -Dm0755 ${lib.escapeShellArg "${init}/bin/init"} "$work/bootstrap/init"
-        ${lib.optionalString (
-          nsmKo != null
-        ) ''install -Dm0755 ${lib.escapeShellArg (toString nsmKo)} "$work/bootstrap/nsm.ko"''}
+        install -Dm0755 ${lib.escapeShellArg "${bootstrap}/bin/init"} "$work/bootstrap/init"
         find "$work/bootstrap" -exec touch -h -d @1 {} +
         (
           cd "$work/bootstrap"
@@ -85,10 +79,9 @@ let
       image,
       name ? "enclave",
       version ? "1",
-      nsmKo ? null,
     }:
     let
-      initrd = initrds { inherit image nsmKo; };
+      initrd = initrds image;
     in
     pkgs.runCommand "enclave-eif-${name}"
       {
@@ -116,44 +109,7 @@ let
         sed -n '/^{/,$p' "$out/eif-build.txt" > "$out/pcr.json"
         (cd "$out"; sha256sum enclave.eif > sha256.txt)
       '';
-
-  mkCommand =
-    {
-      image,
-      name ? "enclave",
-      version ? "1",
-      nsmKo ? null,
-    }:
-    let
-      eif = mkDerivation {
-        inherit
-          image
-          name
-          version
-          nsmKo
-          ;
-      };
-    in
-    pkgs.writeShellApplication {
-      name = "build-enclave-eif";
-      runtimeInputs = [ pkgs.coreutils ];
-      text = ''
-        if [ "$#" -ne 1 ]; then
-          echo "Usage: build-enclave-eif OUTPUT_DIRECTORY" >&2
-          exit 2
-        fi
-        output=$(realpath -m -- "$1")
-        if [ -e "$output" ]; then
-          echo "Output directory already exists: $output" >&2
-          exit 1
-        fi
-        mkdir -p -- "$output"
-        cp -L ${eif}/enclave.eif ${eif}/pcr.json ${eif}/sha256.txt "$output/"
-        chmod u+w "$output/enclave.eif" "$output/pcr.json" "$output/sha256.txt"
-        (cd "$output"; sha256sum -c sha256.txt)
-      '';
-    };
 in
 {
-  inherit mkCommand mkDerivation;
+  inherit mkDerivation;
 }
