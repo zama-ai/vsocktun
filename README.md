@@ -163,9 +163,9 @@ repositories such as KMS:
   cache is involved. `mkEifDerivation` does the same as a pure, cacheable store
   path
 - `lib.<system>.enclave.mkLauncherImage` builds a parent-side image containing
-  nitro-cli, vsocktun, the parent networking tools, and an embedded EIF
-- `lib.<system>.enclave.mkLauncherCommand` wraps that builder as an `nix run`
-  command for a consumer flake and an EIF directory
+  nitro-cli, vsocktun, the parent networking tools, and an embedded EIF.
+  Pass `eif = "${eifBuild}/enclave.eif";` to embed the output of
+  `eifBuild = mkEifDerivation { inherit image; };`.
 
 The EIF builder consumes the same docker-archive tarball that `mkRuntimeImage`
 produces. It emits `enclave.eif`, `pcr.json` (PCR0-PCR2), and `sha256.txt`.

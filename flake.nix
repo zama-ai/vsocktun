@@ -113,14 +113,6 @@
                 }
                 // args
               );
-            mkLauncherCommand =
-              args:
-              import ./nix/launcher-command.nix (
-                {
-                  inherit pkgs;
-                }
-                // args
-              );
             parentTools = env.parentTools.env;
             parentToolsPackages = env.parentTools.packages;
           };
