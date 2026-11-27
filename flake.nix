@@ -54,11 +54,10 @@
           };
           enclaveParts = import ./nix/enclave.nix { inherit pkgs rustPlatform; };
           parentTools = import ./nix/parent-tools.nix { inherit pkgs vsocktun; };
+          eifBuild = import ./nix/eif-build.nix { inherit pkgs rustPlatform; };
           eif = import ./nix/eif.nix {
-            inherit pkgs;
+            inherit pkgs eifBuild;
             inherit (enclaveParts)
-              nitroCli
-              linuxkit
               kernel
               init
               kernelCmdline
@@ -73,6 +72,7 @@
             enclaveParts
             parentTools
             eif
+            eifBuild
             ;
         }
       );
@@ -88,9 +88,9 @@
           enclave = {
             inherit (env.enclaveParts)
               nitroCli
-              linuxkit
               kernel
               ;
+            inherit (env) eifBuild;
             bootstrap = env.enclaveParts.init;
             mkEifCommand = env.eif.mkCommand;
             mkEifDerivation = env.eif.mkDerivation;
@@ -136,13 +136,14 @@
           nitro-cli = env.enclaveParts.nitroCli;
           enclave-kernel = env.enclaveParts.kernel;
           enclave-bootstrap = env.enclaveParts.init;
-          enclave-linuxkit = env.enclaveParts.linuxkit;
+          enclave-eif-build = env.eifBuild;
           enclave-parent-tools = env.parentTools.env;
           default = env.vsocktun;
         }
       );
       checks = forAllSystems (system: {
         default = self.packages.${system}.default;
+        enclave-eif-build = self.packages.${system}.enclave-eif-build;
       });
       devShells = forAllSystems (
         system:

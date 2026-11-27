@@ -1,7 +1,6 @@
 {
   pkgs,
-  nitroCli,
-  linuxkit,
+  eifBuild,
   kernel,
   init,
   kernelCmdline,
@@ -9,76 +8,135 @@
 let
   inherit (pkgs) lib;
   kernelName = if pkgs.stdenv.hostPlatform.isx86_64 then "bzImage" else "Image";
-  blobs = pkgs.linkFarm "nitro-enclave-blobs" [
+  arch = if pkgs.stdenv.hostPlatform.isx86_64 then "x86_64" else "aarch64";
+  # Fixed so the EIF metadata is reproducible. It is not part of PCR0-PCR2.
+  buildTime = "1970-01-01T00:00:01Z";
+
+  # Convert the Nix image tarball to an OCI layout, unpack it with umoci, and
+  # write the two initrds expected by the Nitro bootstrap init. Everything is
+  # file-based, so this runs in the sandbox and is cached by Nix.
+  initrds =
     {
-      name = kernelName;
-      path = "${kernel}/${kernelName}";
-    }
+      image,
+      nsmKo ? null,
+    }:
+    pkgs.runCommand "enclave-initrds"
+      {
+        nativeBuildInputs = [
+          pkgs.skopeo
+          pkgs.umoci
+          pkgs.cpio
+          pkgs.jq
+          pkgs.findutils
+          pkgs.coreutils
+        ];
+      }
+      ''
+        export HOME="$TMPDIR/home"
+        export XDG_RUNTIME_DIR="$TMPDIR/run"
+        mkdir -p "$HOME" "$XDG_RUNTIME_DIR" "$out"
+        work=$(mktemp -d)
+        trap 'chmod -R u+w -- "$work" 2>/dev/null || true; rm -rf -- "$work"' EXIT
+
+        mkdir -p "$work/oci" "$work/bootstrap/dev" "$work/customer"
+        image=${lib.escapeShellArg (toString image)}
+
+        skopeo --insecure-policy --tmpdir "$TMPDIR" copy \
+          "docker-archive:$image" "oci:$work/oci:latest"
+        skopeo --insecure-policy --tmpdir "$TMPDIR" inspect --config \
+          "docker-archive:$image" > "$work/config.json"
+        jq -r '(.config.Cmd // .config.Entrypoint)[]' "$work/config.json" > "$work/cmd"
+        jq -r '.config.Env[]?' "$work/config.json" > "$work/env"
+
+        umoci unpack --rootless --image "$work/oci:latest" "$work/bundle"
+        rootfs="$work/bundle/rootfs"
+        for directory in dev run sys var proc tmp; do
+          mkdir -p "$rootfs/$directory"
+        done
+
+        install -Dm0755 ${lib.escapeShellArg "${init}/bin/init"} "$work/bootstrap/init"
+        ${lib.optionalString (
+          nsmKo != null
+        ) ''install -Dm0755 ${lib.escapeShellArg (toString nsmKo)} "$work/bootstrap/nsm.ko"''}
+        find "$work/bootstrap" -exec touch -h -d @1 {} +
+        (
+          cd "$work/bootstrap"
+          find . -mindepth 1 -printf '%P\0' |
+            sort -z |
+            cpio --null -o --format=newc --owner=0:0 --reproducible
+        ) > "$out/bootstrap.cpio"
+
+        mv "$rootfs" "$work/customer/rootfs"
+        install -Dm0644 "$work/cmd" "$work/customer/cmd"
+        install -Dm0644 "$work/env" "$work/customer/env"
+        find "$work/customer" -exec touch -h -d @1 {} +
+        (
+          cd "$work/customer"
+          find . -mindepth 1 -printf '%P\0' |
+            sort -z |
+            cpio --null -o --format=newc --owner=0:0 --reproducible
+        ) > "$out/customer.cpio"
+      '';
+
+  # Assemble the EIF with AWS's eif_build. The AWS tool owns EIF metadata,
+  # measurements, and signing; Nix owns the inputs and the output paths.
+  mkDerivation =
     {
-      name = "${kernelName}.config";
-      path = kernel.configfile;
-    }
-    {
-      name = "init";
-      path = "${init}/bin/init";
-    }
-    {
-      name = "cmdline";
-      path = kernelCmdline;
-    }
-    {
-      name = "linuxkit";
-      path = "${linuxkit}/bin/linuxkit";
-    }
-  ];
-  dockerHost = ''
-    if [ -z "''${DOCKER_HOST:-}" ]; then
-      for socket in /run/user/*/docker.sock /run/docker.sock /var/run/docker.sock; do
-        if [ -S "$socket" ]; then
-          export DOCKER_HOST="unix://$socket"
-          if docker info > /dev/null 2>&1; then
-            break
-          fi
-          unset DOCKER_HOST
-        fi
-      done
-    fi
-    if [ -z "''${DOCKER_HOST:-}" ] && docker context inspect >/dev/null 2>&1; then
-      DOCKER_HOST=$(docker context inspect --format '{{.Endpoints.docker.Host}}')
-      export DOCKER_HOST
-    fi
-    if [ -z "''${DOCKER_HOST:-}" ]; then
-      echo "could not find a working Docker daemon; set DOCKER_HOST" >&2
-      exit 1
-    fi
-    unset DOCKER_CONTEXT
-    docker info > /dev/null
-  '';
-  commonEnv = ''
-    export HOME="$work/home"
-    export NITRO_CLI_LOGS_PATH="$work/logs"
-    export NITRO_CLI_ARTIFACTS="$work/artifacts"
-    export NITRO_CLI_BLOBS=${blobs}
-    mkdir -p "$HOME" "$NITRO_CLI_LOGS_PATH" "$NITRO_CLI_ARTIFACTS"
-  '';
-in
-{
-  # Build an EIF and leave it in a directory chosen by the caller. Assembly
-  # needs the host Docker daemon, so this runs through `nix run`.
+      image,
+      name ? "enclave",
+      version ? "1",
+      nsmKo ? null,
+    }:
+    let
+      initrd = initrds { inherit image nsmKo; };
+    in
+    pkgs.runCommand "enclave-eif-${name}"
+      {
+        nativeBuildInputs = [
+          eifBuild
+          pkgs.coreutils
+          pkgs.gnused
+        ];
+      }
+      ''
+        mkdir -p "$out"
+        eif_build \
+          --kernel ${lib.escapeShellArg "${kernel}/${kernelName}"} \
+          --cmdline "$(cat ${lib.escapeShellArg (toString kernelCmdline)})" \
+          --ramdisk ${initrd}/bootstrap.cpio \
+          --ramdisk ${initrd}/customer.cpio \
+          --output "$out/enclave.eif" \
+          --name ${lib.escapeShellArg (toString name)} \
+          --version ${lib.escapeShellArg (toString version)} \
+          --arch ${lib.escapeShellArg arch} \
+          --build-time ${lib.escapeShellArg buildTime} \
+          --img-os Linux \
+          --img-kernel ${lib.escapeShellArg (kernel.modDirVersion or kernel.version)} \
+          > "$out/eif-build.txt"
+        sed -n '/^{/,$p' "$out/eif-build.txt" > "$out/pcr.json"
+        (cd "$out"; sha256sum enclave.eif > sha256.txt)
+      '';
+
   mkCommand =
     {
       image,
       name ? "enclave",
       version ? "1",
+      nsmKo ? null,
     }:
+    let
+      eif = mkDerivation {
+        inherit
+          image
+          name
+          version
+          nsmKo
+          ;
+      };
+    in
     pkgs.writeShellApplication {
       name = "build-enclave-eif";
-      runtimeInputs = [
-        nitroCli
-        pkgs.docker-client
-        pkgs.coreutils
-        pkgs.jq
-      ];
+      runtimeInputs = [ pkgs.coreutils ];
       text = ''
         if [ "$#" -ne 1 ]; then
           echo "Usage: build-enclave-eif OUTPUT_DIRECTORY" >&2
@@ -89,65 +147,13 @@ in
           echo "Output directory already exists: $output" >&2
           exit 1
         fi
-        ${dockerHost}
-        work=$(mktemp -d)
-        cleanup() {
-          status=$?
-          if [ "$status" -eq 0 ]; then
-            rm -rf -- "$work"
-          else
-            echo "Build artifacts retained in $work" >&2
-          fi
-        }
-        trap cleanup EXIT
-        ${commonEnv}
         mkdir -p -- "$output"
-        docker load --input ${image}
-        nitro-cli build-enclave --docker-uri ${image.imageName}:${image.imageTag} \
-          --name ${name} --version ${version} --output-file "$output/enclave.eif" > "$work/build-info.json"
-        jq -e '.Measurements' "$work/build-info.json" > "$output/pcr.json"
-        nitro-cli describe-eif --eif-path "$output/enclave.eif" > "$work/described-eif.json"
-        jq -e '.CheckCRC == true and .IsSigned == false' "$work/described-eif.json"
-        jq '.Measurements' "$work/described-eif.json" | cmp - "$output/pcr.json"
-        (cd "$output"; sha256sum enclave.eif > sha256.txt)
+        cp -L ${eif}/enclave.eif ${eif}/pcr.json ${eif}/sha256.txt "$output/"
+        chmod u+w "$output/enclave.eif" "$output/pcr.json" "$output/sha256.txt"
+        (cd "$output"; sha256sum -c sha256.txt)
       '';
     };
-
-  # Build an EIF as a store path so an image can embed it. This uses the host
-  # Docker daemon, so the derivation runs without a sandbox and cannot be
-  # substituted from a binary cache.
-  mkDerivation =
-    {
-      image,
-      name ? "enclave",
-      version ? "1",
-    }:
-    pkgs.runCommand "enclave-eif-${name}"
-      {
-        __noSandbox = true;
-        impureEnvVars = [ "DOCKER_HOST" ];
-        nativeBuildInputs = [
-          nitroCli
-          pkgs.docker-client
-          pkgs.coreutils
-          pkgs.jq
-        ];
-      }
-      ''
-        work=$(mktemp -d)
-        trap 'rm -rf -- "$work"' EXIT
-        ${commonEnv}
-        ${dockerHost}
-        mkdir -p "$out"
-        docker load --input ${image}
-        nitro-cli build-enclave --docker-uri ${image.imageName}:${image.imageTag} \
-          --name ${name} --version ${version} --output-file "$out/enclave.eif" > "$work/build-info.json"
-        jq -e '.Measurements' "$work/build-info.json" > "$out/pcr.json"
-        nitro-cli describe-eif --eif-path "$out/enclave.eif" > "$work/described-eif.json"
-        jq -e '.CheckCRC == true and .IsSigned == false' "$work/described-eif.json"
-        jq '.Measurements' "$work/described-eif.json" | cmp - "$out/pcr.json"
-        (cd "$out"; sha256sum enclave.eif > sha256.txt)
-      '';
-
-  inherit blobs;
+in
+{
+  inherit mkCommand mkDerivation;
 }
