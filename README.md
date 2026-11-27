@@ -176,6 +176,45 @@ A service repository supplies its application image, entrypoint, and EIF; this
 flake supplies the kernel, bootstrap, EIF tooling, nitro-cli, vsocktun, and the
 image templates.
 
+### Build both Linux image architectures locally
+
+On x86_64 Linux, build x86_64 images natively and cross-build aarch64 images.
+On Apple Silicon, run Nix **inside a local aarch64 Linux VM**: build aarch64
+images natively and cross-build x86_64 images inside that same VM. No remote
+builder or x86_64 VM is needed. Run from a checkout of the consumer flake in
+the guest and copy the resulting archive back to macOS if needed. The Darwin
+flake outputs build standalone Linux binaries only, not EIFs or images.
+
+A consumer such as KMS uses the same three builder functions for both
+targets. Here `system` is the Linux system running the build and
+`targetSystem` is the system that will run the image:
+
+```nix
+enclave =
+  if system == targetSystem then
+    vsocktun.lib.${system}.enclave
+  else
+    vsocktun.lib.${system}.cross.${targetSystem}.enclave;
+```
+
+Build the application binaries and base image for that same target. For a
+cross build, use `pkgs.pkgsCross.aarch64-multiplatform` from x86_64 Linux
+or `pkgs.pkgsCross.gnu64` from aarch64 Linux. The kernel, bootstrap, and
+image contents target Linux on the selected architecture; `eif_build` and
+archive tools run on the build machine.
+
+From this repo, smoke-test both complete image pipelines on your Linux
+machine or inside the Linux guest:
+
+```sh
+system="$(uname -m)-linux"
+nix build --builders '' --no-link \
+  ".#checks.$system.enclave-images" ".#checks.$system.enclave-images-cross"
+```
+
+The checks inspect both archives, check representative ELF binaries, and
+verify the launcher contains the generated EIF. They don't boot an enclave.
+
 ## Debugging
 
 When traffic does not appear to flow through the tunnel:

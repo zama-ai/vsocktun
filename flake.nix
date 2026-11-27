@@ -21,20 +21,37 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      environments = forAllSystems (
+      crossTargets = {
+        x86_64-linux = "aarch64-linux";
+        aarch64-linux = "x86_64-linux";
+      };
+      importPkgs =
         system:
+        import nixpkgs {
+          inherit system;
+          overlays = [ rust-overlay.overlays.default ];
+        };
+      makeRustPlatform =
+        pkgs: toolchain:
+        pkgs.makeRustPlatform {
+          cargo = toolchain;
+          rustc = toolchain;
+        };
+      makeEnvironment =
+        pkgs:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [ rust-overlay.overlays.default ];
-          };
+          inherit (pkgs.stdenv) buildPlatform hostPlatform;
+          native = buildPlatform.canExecute hostPlatform;
+          emulated = !native && hostPlatform.emulatorAvailable pkgs.buildPackages;
           # Keep in step with the consumer's toolchain so that both builds share
           # one rustc derivation.
-          toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-          rustPlatform = pkgs.makeRustPlatform {
-            cargo = toolchain;
-            rustc = toolchain;
-          };
+          nativeToolchain = pkgs.buildPackages.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+          toolchain =
+            if native then
+              nativeToolchain
+            else
+              nativeToolchain.override { targets = [ hostPlatform.rust.rustcTarget ]; };
+          rustPlatform = makeRustPlatform pkgs toolchain;
           workspace = builtins.fromTOML (builtins.readFile ./Cargo.toml);
           vsocktun = rustPlatform.buildRustPackage {
             pname = "vsocktun";
@@ -43,8 +60,11 @@
             cargoLock.lockFile = ./Cargo.lock;
             # Upstream network tests require privileged network namespaces.
             doCheck = false;
-            doInstallCheck = true;
+            doInstallCheck = native;
             installCheckPhase = "$out/bin/vsocktun --help > /dev/null";
+            postFixup = pkgs.lib.optionalString emulated ''
+              ${hostPlatform.emulator pkgs.buildPackages} "$out/bin/vsocktun" --help > /dev/null
+            '';
             strictDeps = true;
             meta = {
               description = workspace.package.description;
@@ -54,7 +74,11 @@
           };
           enclaveParts = import ./nix/enclave.nix { inherit pkgs rustPlatform; };
           parentTools = import ./nix/parent-tools.nix { inherit pkgs vsocktun; };
-          eifBuild = import ./nix/eif-build.nix { inherit pkgs rustPlatform; };
+          # eif_build runs on the builder; the kernel and image contents target Linux.
+          eifBuild = import ./nix/eif-build.nix {
+            pkgs = pkgs.buildPackages;
+            rustPlatform = makeRustPlatform pkgs.buildPackages nativeToolchain;
+          };
           eif = import ./nix/eif.nix {
             inherit pkgs eifBuild;
             inherit (enclaveParts)
@@ -74,68 +98,114 @@
             eif
             eifBuild
             ;
-        }
-      );
-    in
-    {
-      lib = forAllSystems (
+        };
+      environments = forAllSystems (system: makeEnvironment (importPkgs system));
+      crossEnvironments = forAllSystems (
         system:
         let
-          env = environments.${system};
+          inherit (environments.${system}.pkgs) pkgsCross;
+        in
+        makeEnvironment (
+          if crossTargets.${system} == "aarch64-linux" then
+            pkgsCross.aarch64-multiplatform
+          else
+            pkgsCross.gnu64
+        )
+      );
+      darwinPkgs = importPkgs "aarch64-darwin";
+      enclaveBuilders =
+        env:
+        let
           inherit (env) pkgs;
         in
         {
-          enclave = {
-            inherit (env.enclaveParts)
-              nitroCli
-              kernel
-              bootstrap
-              ;
-            inherit (env) eifBuild;
-            mkEifDerivation = env.eif.mkDerivation;
-            mkRuntimeImage =
-              args:
-              import ./nix/runtime-image.nix (
-                {
-                  inherit pkgs;
-                  inherit (env) vsocktun;
-                }
-                // args
-              );
-            mkLauncherImage =
-              args:
-              import ./nix/launcher-image.nix (
-                {
-                  inherit pkgs;
-                  inherit (env.enclaveParts) nitroCli;
-                  tools = env.parentTools.packages;
-                }
-                // args
-              );
-            parentTools = env.parentTools.env;
-            parentToolsPackages = env.parentTools.packages;
-          };
-        }
-      );
-      packages = forAllSystems (
-        system:
-        let
-          env = environments.${system};
-        in
-        {
-          inherit (env) vsocktun;
-          nitro-cli = env.enclaveParts.nitroCli;
-          enclave-kernel = env.enclaveParts.kernel;
-          enclave-bootstrap = env.enclaveParts.bootstrap;
-          enclave-eif-build = env.eifBuild;
-          enclave-parent-tools = env.parentTools.env;
-          default = env.vsocktun;
-        }
-      );
-      checks = forAllSystems (system: {
-        default = self.packages.${system}.default;
-        enclave-eif-build = self.packages.${system}.enclave-eif-build;
+          inherit (env.enclaveParts)
+            nitroCli
+            kernel
+            bootstrap
+            ;
+          inherit (env) eifBuild;
+          mkEifDerivation = env.eif.mkDerivation;
+          mkRuntimeImage =
+            args:
+            import ./nix/runtime-image.nix (
+              {
+                inherit pkgs;
+                inherit (env) vsocktun;
+              }
+              // args
+            );
+          mkLauncherImage =
+            args:
+            import ./nix/launcher-image.nix (
+              {
+                inherit pkgs;
+                inherit (env.enclaveParts) nitroCli;
+                tools = env.parentTools.packages;
+              }
+              // args
+            );
+          parentTools = env.parentTools.env;
+          parentToolsPackages = env.parentTools.packages;
+        };
+      checkEnclaveImages =
+        env:
+        import ./nix/check-enclave-images.nix {
+          inherit (env) pkgs;
+          enclave = enclaveBuilders env;
+        };
+    in
+    {
+      lib = forAllSystems (system: {
+        enclave = enclaveBuilders environments.${system};
+        cross.${crossTargets.${system}}.enclave = enclaveBuilders crossEnvironments.${system};
       });
+      packages =
+        forAllSystems (
+          system:
+          let
+            env = environments.${system};
+            crossEnv = crossEnvironments.${system};
+          in
+          {
+            inherit (env) vsocktun;
+            nitro-cli = env.enclaveParts.nitroCli;
+            enclave-kernel = env.enclaveParts.kernel;
+            enclave-bootstrap = env.enclaveParts.bootstrap;
+            enclave-eif-build = env.eifBuild;
+            enclave-parent-tools = env.parentTools.env;
+            default = env.vsocktun;
+          }
+          // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+            vsocktun-aarch64 = crossEnv.vsocktun;
+            nitro-cli-aarch64 = crossEnv.enclaveParts.nitroCli;
+            enclave-kernel-aarch64 = crossEnv.enclaveParts.kernel;
+            enclave-bootstrap-aarch64 = crossEnv.enclaveParts.bootstrap;
+            enclave-parent-tools-aarch64 = crossEnv.parentTools.env;
+          }
+          // nixpkgs.lib.optionalAttrs (system == "aarch64-linux") {
+            vsocktun-x86_64 = crossEnv.vsocktun;
+          }
+        )
+        // {
+          aarch64-darwin = {
+            vsocktun-x86_64 = (makeEnvironment darwinPkgs.pkgsCross.gnu64).vsocktun;
+            vsocktun-aarch64-static =
+              (makeEnvironment darwinPkgs.pkgsCross.aarch64-multiplatform.pkgsStatic).vsocktun;
+          };
+        };
+      checks =
+        forAllSystems (system: {
+          default = self.packages.${system}.default;
+          enclave-eif-build = self.packages.${system}.enclave-eif-build;
+          enclave-images = checkEnclaveImages environments.${system};
+          enclave-images-cross = checkEnclaveImages crossEnvironments.${system};
+        })
+        // {
+          aarch64-darwin = {
+            inherit (self.packages.aarch64-darwin) vsocktun-x86_64 vsocktun-aarch64-static;
+          };
+        };
       devShells = forAllSystems (
         system:
         let
