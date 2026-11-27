@@ -6,9 +6,10 @@
   kernelCmdline,
 }:
 let
-  inherit (pkgs) lib;
+  inherit (pkgs) buildPackages lib;
   kernelName = if pkgs.stdenv.hostPlatform.isx86_64 then "bzImage" else "Image";
   arch = if pkgs.stdenv.hostPlatform.isx86_64 then "x86_64" else "aarch64";
+  architecture = pkgs.stdenv.hostPlatform.go.GOARCH;
   # Fixed so the EIF metadata is reproducible. It is not part of PCR0-PCR2.
   buildTime = "1970-01-01T00:00:01Z";
 
@@ -17,15 +18,15 @@ let
   # file-based, so this runs in the sandbox and is cached by Nix.
   initrds =
     image:
-    pkgs.runCommand "enclave-initrds"
+    buildPackages.runCommand "enclave-initrds"
       {
-        nativeBuildInputs = [
-          pkgs.skopeo
-          pkgs.umoci
-          pkgs.cpio
-          pkgs.jq
-          pkgs.findutils
-          pkgs.coreutils
+        nativeBuildInputs = with buildPackages; [
+          skopeo
+          umoci
+          cpio
+          jq
+          findutils
+          coreutils
         ];
       }
       ''
@@ -38,10 +39,16 @@ let
         mkdir -p "$work/oci" "$work/bootstrap/dev" "$work/customer"
         image=${lib.escapeShellArg (toString image)}
 
-        skopeo --insecure-policy --tmpdir "$TMPDIR" copy \
-          "docker-archive:$image" "oci:$work/oci:latest"
-        skopeo --insecure-policy --tmpdir "$TMPDIR" inspect --config \
+        skopeo --insecure-policy --tmpdir "$TMPDIR" --override-os linux \
+          --override-arch ${architecture} inspect --config \
           "docker-archive:$image" > "$work/config.json"
+        if ! jq -e '.os == "linux" and .architecture == "${architecture}"' \
+          "$work/config.json" >/dev/null; then
+          echo "Expected a linux/${architecture} runtime image" >&2
+          exit 1
+        fi
+        skopeo --insecure-policy --tmpdir "$TMPDIR" --override-os linux \
+          --override-arch ${architecture} copy "docker-archive:$image" "oci:$work/oci:latest"
         jq -r '(.config.Cmd // .config.Entrypoint)[]' "$work/config.json" > "$work/cmd"
         jq -r '.config.Env[]?' "$work/config.json" > "$work/env"
 
@@ -83,12 +90,12 @@ let
     let
       initrd = initrds image;
     in
-    pkgs.runCommand "enclave-eif-${name}"
+    buildPackages.runCommand "enclave-eif-${name}"
       {
         nativeBuildInputs = [
           eifBuild
-          pkgs.coreutils
-          pkgs.gnused
+          buildPackages.coreutils
+          buildPackages.gnused
         ];
       }
       ''
