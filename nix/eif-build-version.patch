@@ -1,0 +1,7 @@
+Use the image_version argument, not the image name, for ImageVersion.
+
+--- a/eif_build/src/main.rs
++++ b/eif_build/src/main.rs
+@@ -188,1 +188,1 @@
+-    let img_version = matches.get_one::<String>("image_name").map(String::from);
++    let img_version = matches.get_one::<String>("image_version").map(String::from);

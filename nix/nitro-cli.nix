@@ -7,10 +7,6 @@ rustPlatform.buildRustPackage {
     hash = "sha256-r3VBa/hMoD7Wuq2Fc4NVbdrJkZYj4uziZk24Y1e/1GA=";
   };
   cargoHash = "sha256-W15GQQraJJ0ad8TbAq9fAWMvKHyDYXJ3UJmjjICDEIw=";
-  patches = [
-    ./nitro-cli-reproducible.patch
-    ./nitro-cli-built-in-nsm.patch
-  ];
   nativeBuildInputs = [ pkgs.pkg-config ];
   buildInputs = [ pkgs.openssl ];
   # nixpkgs' Cargo setup hook asks aws-lc-sys to link the system OpenSSL, but

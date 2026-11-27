@@ -9,7 +9,6 @@ let
     hash = "sha256-DmNnH6lqweRz1u8nza6FvgJFvDGPactpHruyq0SYkp8=";
   };
   nitroCli = import ./nitro-cli.nix { inherit pkgs rustPlatform; };
-  linuxkit = import (bootstrapSource + "/linuxkit/linuxkit.nix") { inherit pkgs; };
   init = pkgs.pkgsStatic.stdenv.mkDerivation {
     pname = "nitro-bootstrap-init";
     version = "f718dea";
@@ -76,7 +75,6 @@ in
 {
   inherit
     nitroCli
-    linuxkit
     init
     kernel
     kernelCmdline

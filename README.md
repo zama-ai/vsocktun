@@ -154,19 +154,27 @@ The flake also provides the generic Nitro enclave plumbing used by service
 repositories such as KMS:
 
 - `packages.<system>.nitro-cli`, `enclave-kernel`, `enclave-bootstrap`,
-  `enclave-linuxkit`, and `enclave-parent-tools`
+  `enclave-eif-build`, and `enclave-parent-tools`
 - `lib.<system>.enclave.mkRuntimeImage` adds vsocktun and an entrypoint to an
   application image, producing the image that becomes the EIF
-- `lib.<system>.enclave.mkEifCommand` builds an unsigned EIF from such an image
-  through the host Docker daemon; `mkEifDerivation` does the same as a store
-  path when the build environment can reach a Docker socket
+- `lib.<system>.enclave.mkEifCommand` unpacks the image tarball with
+  `skopeo`/`umoci`, writes the bootstrap and customer initrds with `cpio`, and
+  assembles the EIF with AWS's `eif_build`; no Docker daemon or external image
+  cache is involved. `mkEifDerivation` does the same as a pure, cacheable store
+  path
 - `lib.<system>.enclave.mkLauncherImage` builds a parent-side image containing
   nitro-cli, vsocktun, the parent networking tools, and an embedded EIF
 - `lib.<system>.enclave.mkLauncherCommand` wraps that builder as an `nix run`
   command for a consumer flake and an EIF directory
 
+The EIF builder consumes the same docker-archive tarball that `mkRuntimeImage`
+produces. It emits `enclave.eif`, `pcr.json` (PCR0-PCR2), and `sha256.txt`.
+Because the image tar is an ordinary Nix input and the initrds and EIF are
+separate derivations, the build is sandboxed, reproducible, and served from a
+binary cache.
+
 A service repository supplies its application image, entrypoint, and EIF; this
-flake supplies the kernel, bootstrap, LinuxKit, nitro-cli, vsocktun, and the
+flake supplies the kernel, bootstrap, EIF tooling, nitro-cli, vsocktun, and the
 image templates.
 
 ## Debugging
