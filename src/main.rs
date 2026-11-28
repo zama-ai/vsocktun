@@ -18,7 +18,7 @@ mod vsock;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
-use protocol::{FrameReader, PendingFramedWrite, PendingSliceWrite};
+use protocol::{FRAME_HEADER_BYTES, FrameReader, PendingSliceWrite};
 use route_manager::{Route, RouteManager};
 use stats::{ShardStats, TunnelStats};
 use std::fmt::Arguments;
@@ -812,7 +812,9 @@ async fn forward_tun_to_socket(
     mut cancelled: watch::Receiver<bool>,
 ) -> Result<()> {
     let raw_tun_frames = tun_queue.tcp_gso();
-    let mut tun_buf = vec![0_u8; max_tun_frame_bytes];
+    // The packet is read behind spare room for the frame header, so that header
+    // and packet go to the socket as one buffer with one write.
+    let mut frame_buf = vec![0_u8; FRAME_HEADER_BYTES + max_tun_frame_bytes];
 
     loop {
         if *cancelled.borrow() {
@@ -827,7 +829,7 @@ async fn forward_tun_to_socket(
                     Err(_) => return Ok(()),
                 }
             }
-            result = tun_queue.recv(&mut tun_buf) => {
+            result = tun_queue.recv(&mut frame_buf[FRAME_HEADER_BYTES..]) => {
                 result.with_context(|| format!("failed to read packet from TUN queue {}", shard_log.shard))?
             }
         };
@@ -836,10 +838,11 @@ async fn forward_tun_to_socket(
             bail!("TUN queue {} closed unexpectedly", shard_log.shard);
         }
 
-        let packet = &tun_buf[..packet_len];
-        let mut pending_socket_write = PendingFramedWrite::new(packet).with_context(|| {
+        let frame = &mut frame_buf[..FRAME_HEADER_BYTES + packet_len];
+        let mut pending_socket_write = PendingSliceWrite::framed(frame).with_context(|| {
             format!("failed to frame TUN payload from queue {}", shard_log.shard)
         })?;
+        let packet = &pending_socket_write.bytes()[FRAME_HEADER_BYTES..];
         // TODO: see the TODO at the clock read in `forward_socket_to_tun`.
         let write_started = Instant::now();
         let mut writes = 0;

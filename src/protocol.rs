@@ -14,7 +14,6 @@ use ciborium::{de::from_reader, ser::into_writer};
 use std::future::poll_fn;
 use std::io;
 use std::io::Cursor;
-use std::io::IoSlice;
 use std::pin::Pin;
 use std::task::Poll;
 use tokio::io::ReadBuf;
@@ -499,7 +498,12 @@ impl FrameReader {
     }
 }
 
-/// Best-effort writer for a borrowed payload slice.
+/// Number of bytes of the big-endian payload length that precedes each packet
+/// on a VSOCK shard.
+pub(crate) const FRAME_HEADER_BYTES: usize = 4;
+
+/// Best-effort writer for a borrowed slice: a packet for the TUN queue, or a
+/// frame for a VSOCK shard.
 ///
 /// This keeps partial-write bookkeeping separate from the higher-level shard
 /// control flow without copying the payload into a new owned buffer.
@@ -516,6 +520,34 @@ impl<'a> PendingSliceWrite<'a> {
         Self { bytes, written: 0 }
     }
 
+    /// Prepares a packet for length-prefixed transmission on a VSOCK shard.
+    ///
+    /// `frame` holds [`FRAME_HEADER_BYTES`] of spare room followed by the
+    /// packet. The length goes into the spare room, so that header and packet
+    /// are one buffer and leave with one write.
+    pub(crate) fn framed(frame: &'a mut [u8]) -> io::Result<Self> {
+        let Some((header, payload)) = frame.split_first_chunk_mut::<FRAME_HEADER_BYTES>() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "frame buffer has no room for the length header",
+            ));
+        };
+        let payload_len = u32::try_from(payload.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "packet exceeds maximum framed size of 4294967295 bytes",
+            )
+        })?;
+        *header = payload_len.to_be_bytes();
+
+        Ok(Self::new(frame))
+    }
+
+    /// Returns the whole slice, written or not.
+    pub(crate) fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
     /// Returns the suffix that still needs to be written.
     pub(crate) fn remaining(&self) -> &[u8] {
         &self.bytes[self.written..]
@@ -527,75 +559,14 @@ impl<'a> PendingSliceWrite<'a> {
         self.written += written;
         self.written == self.bytes.len()
     }
-}
 
-/// Best-effort writer for a framed payload without copying the payload into a
-/// separate owned buffer.
-#[derive(Debug)]
-pub(crate) struct PendingFramedWrite<'a> {
-    header: [u8; 4],
-    header_written: usize,
-    body: &'a [u8],
-    body_written: usize,
-}
-
-impl<'a> PendingFramedWrite<'a> {
-    /// Prepares a borrowed packet for length-prefixed transmission on a VSOCK
-    /// shard.
-    pub(crate) fn new(payload: &'a [u8]) -> io::Result<Self> {
-        let payload_len = u32::try_from(payload.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "packet exceeds maximum framed size of 4294967295 bytes",
-            )
-        })?;
-
-        Ok(Self {
-            header: payload_len.to_be_bytes(),
-            header_written: 0,
-            body: payload,
-            body_written: 0,
-        })
-    }
-
-    fn remaining_header(&self) -> &[u8] {
-        &self.header[self.header_written..]
-    }
-
-    fn remaining_body(&self) -> &[u8] {
-        &self.body[self.body_written..]
-    }
-
-    fn advance(&mut self, written: usize) -> bool {
-        let header_remaining = self.header.len() - self.header_written;
-        if written < header_remaining {
-            self.header_written += written;
-        } else {
-            self.header_written = self.header.len();
-            self.body_written += written - header_remaining;
-        }
-
-        self.header_written == self.header.len() && self.body_written == self.body.len()
-    }
-
-    /// Writes as much of the frame as the underlying stream currently accepts
-    /// and reports whether header and payload are both complete.
+    /// Writes as much of the slice as the underlying stream currently accepts
+    /// and reports whether the whole slice is complete.
     pub(crate) async fn write_to_async<W: AsyncWrite + Unpin>(
         &mut self,
         writer: &mut W,
     ) -> io::Result<bool> {
-        let header = self.remaining_header();
-        let body = self.remaining_body();
-        let written = if !header.is_empty() && !body.is_empty() {
-            let bufs = [IoSlice::new(header), IoSlice::new(body)];
-            writer.write_vectored(&bufs).await?
-        } else {
-            writer
-                .write(if !header.is_empty() { header } else { body })
-                .await?
-        };
-
-        match written {
+        match writer.write(self.remaining()).await? {
             0 => Err(io::Error::new(
                 io::ErrorKind::WriteZero,
                 "failed to make forward progress while writing packet",
@@ -609,7 +580,7 @@ impl<'a> PendingFramedWrite<'a> {
 mod tests {
     use super::{
         BootstrapRequest, BootstrapResponse, FrameReader, Hello, InitialRequest,
-        MAX_BOOTSTRAP_RESPONSE_PAYLOAD_BYTES, PendingFramedWrite, PendingSliceWrite,
+        MAX_BOOTSTRAP_RESPONSE_PAYLOAD_BYTES, PendingSliceWrite,
     };
     use ciborium::ser::into_writer;
     use std::fs::File;
@@ -772,24 +743,6 @@ mod tests {
         }
     }
 
-    fn write_pending_framed<W: Write>(
-        pending: &mut PendingFramedWrite<'_>,
-        writer: &mut W,
-    ) -> io::Result<bool> {
-        let header = pending.remaining_header();
-        let body = pending.remaining_body();
-        let bytes = if !header.is_empty() { header } else { body };
-        match writer.write(bytes) {
-            Ok(0) => Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "failed to make forward progress while writing packet",
-            )),
-            Ok(written) => Ok(pending.advance(written)),
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(false),
-            Err(err) => Err(err),
-        }
-    }
-
     #[test]
     fn hello_round_trip() {
         // This locks down the handshake wire format so both tunnel endpoints keep
@@ -909,11 +862,12 @@ mod tests {
         // This proves the length-prefix framing preserves payload boundaries when
         // packets move between stream-oriented VSOCK and packet-oriented TUN.
         let packet = vec![1_u8, 2, 3, 4, 5];
+        let mut frame = vec![0_u8, 0, 0, 0, 1, 2, 3, 4, 5];
         let mut outgoing =
-            PendingFramedWrite::new(&packet).expect("packet should fit into framed payload");
+            PendingSliceWrite::framed(&mut frame).expect("packet should fit into framed payload");
         let mut file = tempfile().expect("temporary file should be created");
 
-        while !write_pending_framed(&mut outgoing, &mut file)
+        while !write_pending_slice(&mut outgoing, &mut file)
             .expect("packet should write to temporary file")
         {}
 
@@ -932,12 +886,13 @@ mod tests {
     fn frame_reader_keeps_payload_storage_after_completed_frame() {
         // This guards the reuse path that avoids reallocating for every packet on
         // long-lived shard streams.
-        let packet = vec![9_u8, 8, 7, 6, 5];
+        let packet = [9_u8, 8, 7, 6, 5];
+        let mut frame = vec![0_u8, 0, 0, 0, 9, 8, 7, 6, 5];
         let mut outgoing =
-            PendingFramedWrite::new(&packet).expect("packet should fit into framed payload");
+            PendingSliceWrite::framed(&mut frame).expect("packet should fit into framed payload");
         let mut file = tempfile().expect("temporary file should be created");
 
-        while !write_pending_framed(&mut outgoing, &mut file)
+        while !write_pending_slice(&mut outgoing, &mut file)
             .expect("packet should write to temporary file")
         {}
 
@@ -975,12 +930,12 @@ mod tests {
     fn pending_framed_write_handles_partial_writes() {
         // VSOCK writes can also stop mid-header or mid-payload; this keeps the
         // framed writer honest across those boundaries.
-        let packet = [1_u8, 2, 3, 4, 5];
+        let mut frame = [0_u8, 0, 0, 0, 1, 2, 3, 4, 5];
         let mut writer = LimitedWriter::new(2);
         let mut pending =
-            PendingFramedWrite::new(&packet).expect("packet should fit into framed payload");
+            PendingSliceWrite::framed(&mut frame).expect("packet should fit into framed payload");
 
-        while !write_pending_framed(&mut pending, &mut writer)
+        while !write_pending_slice(&mut pending, &mut writer)
             .expect("partial writes should make progress")
         {}
 
