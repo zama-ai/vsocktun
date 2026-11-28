@@ -1,7 +1,9 @@
 //! Counters of the packets that each shard forwards, and their periodic
 //! report.
 //!
-//! The forwarding loops record one event per packet into a [`ShardStats`].
+//! The forwarding loops record one event per packet into a [`ShardStats`],
+//! but only when reports are requested: without them [`TunnelStats::shard`]
+//! returns `None`, and a loop does no work for the counters.
 //! The counters are running totals since the process started. They continue
 //! across sessions, so a reader can take differences without knowing when the
 //! tunnel reconnected. The one exception is the longest write time, which
@@ -35,9 +37,10 @@ pub(crate) struct DirectionStats {
     /// Write calls that those packets needed. More writes than packets means that the destination accepted some packets
     /// only in parts.
     writes: AtomicU64,
-    /// Time from the end of the read of a packet until the destination accepted all of it, in microseconds. It grows
-    /// when the destination is slow to accept data.
-    write_micros: AtomicU64,
+    /// Time from the end of the read of a packet until the destination accepted all of it, in nanoseconds. It grows
+    /// when the destination is slow to accept data. The reports give it in microseconds; the total is kept in
+    /// nanoseconds because a single write can take less than a microsecond more or less than a whole number of them.
+    write_nanos: AtomicU64,
     /// Size of the largest packet, in bytes.
     max_packet_bytes: AtomicU64,
     /// Packets that carry more than one segment. See [`segments_in_frame`].
@@ -45,9 +48,21 @@ pub(crate) struct DirectionStats {
     /// Segments that the packets carry: the number of packets that the same data needs on the wire. Equal to `packets`
     /// when no packet is large.
     segments: AtomicU64,
-    /// Longest write time of one packet since the previous [`Self::take_longest_write`], in microseconds. Not a running
-    /// total.
-    longest_write_micros: AtomicU64,
+    /// Longest write time of one packet since the previous [`Self::snapshot`], in nanoseconds. Not a running total.
+    longest_write_nanos: AtomicU64,
+}
+
+/// The values of a [`DirectionStats`] at one moment.
+#[derive(Clone, Copy, Debug, Default)]
+struct DirectionSnapshot {
+    packets: u64,
+    bytes: u64,
+    writes: u64,
+    write_micros: u64,
+    max_packet_bytes: u64,
+    large_packets: u64,
+    segments: u64,
+    longest_write_micros: u64,
 }
 
 impl DirectionStats {
@@ -61,23 +76,33 @@ impl DirectionStats {
         write_time: Duration,
     ) {
         let bytes = bytes as u64;
-        let write_micros = u64::try_from(write_time.as_micros()).unwrap_or(u64::MAX);
+        let write_nanos = u64::try_from(write_time.as_nanos()).unwrap_or(u64::MAX);
         self.packets.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
         self.writes.fetch_add(writes, Ordering::Relaxed);
-        self.write_micros.fetch_add(write_micros, Ordering::Relaxed);
+        self.write_nanos.fetch_add(write_nanos, Ordering::Relaxed);
         self.max_packet_bytes.fetch_max(bytes, Ordering::Relaxed);
         if segments > 1 {
             self.large_packets.fetch_add(1, Ordering::Relaxed);
         }
         self.segments.fetch_add(segments, Ordering::Relaxed);
-        self.longest_write_micros
-            .fetch_max(write_micros, Ordering::Relaxed);
+        self.longest_write_nanos
+            .fetch_max(write_nanos, Ordering::Relaxed);
     }
 
-    /// Returns the longest write time since the previous call, and starts the next interval.
-    fn take_longest_write(&self) -> u64 {
-        self.longest_write_micros.swap(0, Ordering::Relaxed)
+    /// Reads each counter once, and starts the next interval of the longest write time. A report takes its sums and
+    /// its values for each shard from the same snapshot, so that they agree while packets flow.
+    fn snapshot(&self) -> DirectionSnapshot {
+        DirectionSnapshot {
+            packets: self.packets.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            writes: self.writes.load(Ordering::Relaxed),
+            write_micros: self.write_nanos.load(Ordering::Relaxed) / 1_000,
+            max_packet_bytes: self.max_packet_bytes.load(Ordering::Relaxed),
+            large_packets: self.large_packets.load(Ordering::Relaxed),
+            segments: self.segments.load(Ordering::Relaxed),
+            longest_write_micros: self.longest_write_nanos.swap(0, Ordering::Relaxed) / 1_000,
+        }
     }
 }
 
@@ -93,6 +118,27 @@ const GSO_NONE: u8 = 0;
 /// nothing about the number of segments, so [`segments_in_frame`] clears it before it looks at the kind.
 const GSO_ECN_FLAG: u8 = 0x80;
 
+/// Returns the length of the IPv4 header and the TCP or UDP header at the start of `packet`. Returns `None` for
+/// another kind of packet, and for one that is too short for its own header fields.
+fn ipv4_header_bytes(packet: &[u8]) -> Option<usize> {
+    const TCP: u8 = 6;
+    const UDP: u8 = 17;
+    const UDP_HEADER_BYTES: usize = 8;
+    // First byte: the IP version, then the length of the IP header in units of 4 bytes.
+    let first = *packet.first()?;
+    if first >> 4 != 4 {
+        return None;
+    }
+    let ip_header_bytes = usize::from(first & 0x0f) * 4;
+    let transport_header_bytes = match *packet.get(9)? {
+        // Byte 12 of the TCP header: the length of the TCP header in units of 4 bytes, in the upper half.
+        TCP => usize::from(*packet.get(ip_header_bytes + 12)? >> 4) * 4,
+        UDP => UDP_HEADER_BYTES,
+        _ => return None,
+    };
+    Some(ip_header_bytes + transport_header_bytes)
+}
+
 /// Returns the number of segments that one frame of a TUN queue carries.
 ///
 /// With `raw_tun_frames`, a frame starts with a virtio-net header. The kernel can batch several TCP or UDP segments
@@ -100,12 +146,12 @@ const GSO_ECN_FLAG: u8 = 0x80;
 /// segments of that size.
 ///
 /// A frame counts as one segment in three cases: the tunnel has no such header, the header names no segment size, or
-/// the frame is too short for what its header claims.
+/// the frame is too short for what its headers claim.
 ///
-/// The header fields are in the byte order of the machine that made the frame. Both ends of a tunnel run on the same
-/// machine, so that is the native byte order.
+/// The fields of the virtio-net header are in the byte order of the machine that made the frame. Both ends of a
+/// tunnel run on the same machine, so that is the native byte order.
 ///
-/// The cost for each packet is small: it reads five bytes of a frame that the caller just read or wrote, and it makes
+/// The cost for each packet is small: it reads a few bytes of a frame that the caller just read or wrote, and it makes
 /// one division for a frame that carries several segments.
 pub(crate) fn segments_in_frame(frame: &[u8], raw_tun_frames: bool) -> u64 {
     if !raw_tun_frames || frame.len() < VIRTIO_NET_HDR_LEN {
@@ -114,17 +160,18 @@ pub(crate) fn segments_in_frame(frame: &[u8], raw_tun_frames: bool) -> u64 {
     // struct virtio_net_hdr: flags, gso_type, hdr_len (u16), gso_size (u16),
     // then two checksum fields.
     let gso_type = frame[1] & !GSO_ECN_FLAG;
-    let header_bytes = usize::from(u16::from_ne_bytes([frame[2], frame[3]]));
     let segment_bytes = usize::from(u16::from_ne_bytes([frame[4], frame[5]]));
     if gso_type == GSO_NONE || segment_bytes == 0 {
         return 1;
     }
-    // `hdr_len` covers the IP and transport headers. Each segment gets a copy
-    // of them. The rest is payload, cut into pieces of `gso_size`.
-    let payload = frame
-        .len()
-        .saturating_sub(VIRTIO_NET_HDR_LEN)
-        .saturating_sub(header_bytes);
+    let packet = &frame[VIRTIO_NET_HDR_LEN..];
+    // Each segment gets a copy of the IP and transport headers. The rest is payload, cut into pieces of `gso_size`.
+    // The length of the headers comes from the packet. The `hdr_len` field is not that length: Linux fills it with
+    // the length of the part of the packet that it holds in one piece, which can include payload. It is the fallback
+    // for a packet that is not IPv4 with TCP or UDP, where it can give too few segments.
+    let header_bytes = ipv4_header_bytes(packet)
+        .unwrap_or_else(|| usize::from(u16::from_ne_bytes([frame[2], frame[3]])));
+    let payload = packet.len().saturating_sub(header_bytes);
     (payload.div_ceil(segment_bytes) as u64).max(1)
 }
 
@@ -167,6 +214,8 @@ type DirectionOf = fn(&ShardStats) -> &DirectionStats;
 #[derive(Debug)]
 pub(crate) struct TunnelStats {
     shards: Box<[ShardStats]>,
+    /// Whether the forwarding loops record packets. See [`Self::shard`].
+    packet_counters: bool,
     /// Sessions started. More than one means that the tunnel reconnected. The [crate documentation](crate) says
     /// what a session is.
     sessions: AtomicU64,
@@ -177,22 +226,25 @@ pub(crate) struct TunnelStats {
 }
 
 impl TunnelStats {
-    /// Creates the counters for `shards` shards, all zero.
-    pub(crate) fn new(shards: usize) -> Self {
+    /// Creates the counters for `shards` shards, all zero. With `packet_counters` the forwarding loops record each
+    /// packet; without it only the session counters change.
+    pub(crate) fn new(shards: usize, packet_counters: bool) -> Self {
         Self {
             shards: (0..shards).map(|_| ShardStats::default()).collect(),
+            packet_counters,
             sessions: AtomicU64::new(0),
             session_errors: AtomicU64::new(0),
             connect_failures: AtomicU64::new(0),
         }
     }
 
-    /// Returns the counters of `shard`.
+    /// Returns the counters of `shard` for a forwarding loop, or `None` when packets are not counted. A loop that
+    /// gets `None` must skip all work that only serves the counters, such as the clock reads around a write.
     ///
     /// Panics if `shard` is not below the shard count given to [`Self::new`]. That cannot occur for a shard of a
     /// session: a session has one shard for each TUN queue, and the caller gives the queue count to [`Self::new`].
-    pub(crate) fn shard(&self, shard: usize) -> &ShardStats {
-        &self.shards[shard]
+    pub(crate) fn shard(&self, shard: usize) -> Option<&ShardStats> {
+        self.packet_counters.then(|| &self.shards[shard])
     }
 
     /// Records the start of a session.
@@ -216,6 +268,9 @@ impl TunnelStats {
     /// time of each shard.
     ///
     /// Each call starts the next interval of the longest write time. Only [`report`] must call it.
+    ///
+    /// The write time of a direction is the sum of the times of its shards after each is cut down to whole
+    /// microseconds, so the sum and the shard values of one line agree.
     fn render(
         &self,
         role: &str,
@@ -239,43 +294,35 @@ impl TunnelStats {
             ("vsock_to_tun", |shard| &shard.vsock_to_tun),
         ];
         for (name, direction) in directions {
-            let sum = |counter: fn(&DirectionStats) -> &AtomicU64| -> u64 {
-                self.shards
-                    .iter()
-                    .map(|shard| counter(direction(shard)).load(Ordering::Relaxed))
-                    .sum()
+            let shards: Vec<DirectionSnapshot> = self
+                .shards
+                .iter()
+                .map(|shard| direction(shard).snapshot())
+                .collect();
+            let sum =
+                |value: fn(&DirectionSnapshot) -> u64| -> u64 { shards.iter().map(value).sum() };
+            let max = |value: fn(&DirectionSnapshot) -> u64| -> u64 {
+                shards.iter().map(value).max().unwrap_or(0)
             };
-            let max_packet_bytes = self
-                .shards
-                .iter()
-                .map(|shard| direction(shard).max_packet_bytes.load(Ordering::Relaxed))
-                .max()
-                .unwrap_or(0);
-            let longest_write = self
-                .shards
-                .iter()
-                .map(|shard| direction(shard).take_longest_write())
-                .max()
-                .unwrap_or(0);
             let _ = write!(
                 line,
                 " {name}_packets={} {name}_bytes={} {name}_writes={} {name}_write_us={} \
                  {name}_large_packets={} {name}_segments={} \
-                 {name}_max_packet_bytes={max_packet_bytes} {name}_write_max_us={longest_write}",
-                sum(|stats| &stats.packets),
-                sum(|stats| &stats.bytes),
-                sum(|stats| &stats.writes),
-                sum(|stats| &stats.write_micros),
-                sum(|stats| &stats.large_packets),
-                sum(|stats| &stats.segments),
+                 {name}_max_packet_bytes={} {name}_write_max_us={}",
+                sum(|shard| shard.packets),
+                sum(|shard| shard.bytes),
+                sum(|shard| shard.writes),
+                sum(|shard| shard.write_micros),
+                sum(|shard| shard.large_packets),
+                sum(|shard| shard.segments),
+                max(|shard| shard.max_packet_bytes),
+                max(|shard| shard.longest_write_micros),
             );
-            for (index, shard) in self.shards.iter().enumerate() {
-                let stats = direction(shard);
+            for (index, shard) in shards.iter().enumerate() {
                 let _ = write!(
                     line,
                     " {name}_packets_shard{index}={} {name}_write_us_shard{index}={}",
-                    stats.packets.load(Ordering::Relaxed),
-                    stats.write_micros.load(Ordering::Relaxed),
+                    shard.packets, shard.write_micros,
                 );
             }
         }
@@ -306,7 +353,7 @@ mod tests {
 
     #[test]
     fn render_sums_the_shards_and_lists_each() {
-        let stats = TunnelStats::new(2);
+        let stats = TunnelStats::new(2, true);
         stats.record_session();
         stats.record_session();
         stats.record_session_error();
@@ -314,22 +361,13 @@ mod tests {
         stats.record_connect_failure();
         stats.record_connect_failure();
         let micros = Duration::from_micros;
-        stats
-            .shard(0)
-            .tun_to_vsock
-            .record_packet(1_000, 1, 1, micros(40));
-        stats
-            .shard(1)
+        let shard = |index| stats.shard(index).expect("packets are counted");
+        shard(0).tun_to_vsock.record_packet(1_000, 1, 1, micros(40));
+        shard(1)
             .tun_to_vsock
             .record_packet(60_000, 44, 3, micros(900));
-        stats
-            .shard(1)
-            .tun_to_vsock
-            .record_packet(500, 1, 1, micros(10));
-        stats
-            .shard(1)
-            .vsock_to_tun
-            .record_packet(1_500, 1, 1, micros(7));
+        shard(1).tun_to_vsock.record_packet(500, 1, 1, micros(10));
+        shard(1).vsock_to_tun.record_packet(1_500, 1, 1, micros(7));
 
         assert_eq!(
             stats.render("enclave", 1_700_000_000_000, Some((1_230, 4_560))),
@@ -350,17 +388,16 @@ mod tests {
 
     #[test]
     fn longest_write_covers_one_report_interval_and_totals_do_not() {
-        let stats = TunnelStats::new(1);
-        stats
-            .shard(0)
+        let stats = TunnelStats::new(1, true);
+        let shard = stats.shard(0).expect("packets are counted");
+        shard
             .tun_to_vsock
             .record_packet(100, 1, 1, Duration::from_micros(800));
         let first = stats.render("parent", 0, None);
         assert!(first.contains(" tun_to_vsock_write_max_us=800 "));
         assert!(!first.contains("cpu_user_ms"));
 
-        stats
-            .shard(0)
+        shard
             .tun_to_vsock
             .record_packet(100, 1, 1, Duration::from_micros(30));
         let second = stats.render("parent", 0, None);
@@ -374,13 +411,46 @@ mod tests {
         );
     }
 
-    /// Builds a frame with a virtio-net header and `payload` bytes after
-    /// `header_bytes` of IP and TCP headers.
-    fn frame(gso_type: u8, gso_size: u16, header_bytes: u16, payload: usize) -> Vec<u8> {
-        let mut frame = vec![0_u8; VIRTIO_NET_HDR_LEN + usize::from(header_bytes) + payload];
+    #[test]
+    fn write_time_keeps_the_parts_below_a_microsecond() {
+        let stats = TunnelStats::new(1, true);
+        let shard = stats.shard(0).expect("packets are counted");
+        for _ in 0..1_000 {
+            shard
+                .tun_to_vsock
+                .record_packet(100, 1, 1, Duration::from_nanos(1_900));
+        }
+        let line = stats.render("parent", 0, None);
+        assert!(line.contains(" tun_to_vsock_write_us=1900 "), "{line}");
+        assert!(
+            line.contains(" tun_to_vsock_write_us_shard0=1900"),
+            "{line}"
+        );
+        assert!(line.contains(" tun_to_vsock_write_max_us=1 "), "{line}");
+    }
+
+    #[test]
+    fn no_shard_counters_without_packet_counters() {
+        let stats = TunnelStats::new(2, false);
+        assert!(stats.shard(0).is_none());
+        stats.record_session();
+        let line = stats.render("parent", 0, None);
+        assert!(line.contains(" sessions=1 "), "{line}");
+        assert!(line.contains(" tun_to_vsock_packets=0 "), "{line}");
+    }
+
+    /// Builds a frame with a virtio-net header, then an IPv4 header and a TCP header of 20 bytes each, then
+    /// `payload` bytes. `hdr_len` is the value of that field of the virtio-net header.
+    fn frame(gso_type: u8, gso_size: u16, hdr_len: u16, payload: usize) -> Vec<u8> {
+        const HEADERS: usize = 40;
+        let mut frame = vec![0_u8; VIRTIO_NET_HDR_LEN + HEADERS + payload];
         frame[1] = gso_type;
-        frame[2..4].copy_from_slice(&header_bytes.to_ne_bytes());
+        frame[2..4].copy_from_slice(&hdr_len.to_ne_bytes());
         frame[4..6].copy_from_slice(&gso_size.to_ne_bytes());
+        let packet = &mut frame[VIRTIO_NET_HDR_LEN..];
+        packet[0] = 0x45; // IPv4, header of 5 * 4 bytes
+        packet[9] = 6; // TCP
+        packet[20 + 12] = 0x50; // TCP header of 5 * 4 bytes
         frame
     }
 
@@ -407,7 +477,35 @@ mod tests {
         // Damaged frames count as one segment.
         assert_eq!(segments(vec![0_u8; 3]), 1);
         assert_eq!(segments(frame(TCPV4, 0, 40, 5_000)), 1);
-        assert_eq!(segments(frame(TCPV4, 1_448, 9_000, 100)), 1);
+    }
+
+    #[test]
+    fn segments_do_not_depend_on_the_hdr_len_field() {
+        const TCPV4: u8 = 1;
+        let segments = |frame: Vec<u8>| segments_in_frame(&frame, true);
+        // Linux sets `hdr_len` to the length of the part of the packet that it holds in one piece. Here that part
+        // is the whole packet, payload included.
+        let whole_packet = 40 + 1_448 * 4;
+        assert_eq!(segments(frame(TCPV4, 1_448, whole_packet, 1_448 * 4)), 4);
+        assert_eq!(segments(frame(TCPV4, 1_448, 0, 1_448 * 4)), 4);
+        // IP and TCP options make the headers longer than 40 bytes.
+        let mut with_options = frame(TCPV4, 1_448, 40, 12 + 1_448 * 2);
+        with_options[VIRTIO_NET_HDR_LEN + 20 + 12] = 0x80; // TCP header of 8 * 4 bytes
+        assert_eq!(segments(with_options), 2);
+    }
+
+    #[test]
+    fn segments_of_other_packets_fall_back_to_the_hdr_len_field() {
+        const TCPV6: u8 = 4;
+        let mut ipv6 = frame(TCPV6, 1_000, 60, 20 + 3_000);
+        ipv6[VIRTIO_NET_HDR_LEN] = 0x60;
+        assert_eq!(segments_in_frame(&ipv6, true), 3);
+        assert_eq!(ipv4_header_bytes(&[0x45, 0, 0]), None);
+        // A UDP header has 8 bytes.
+        let mut udp = [0_u8; 28];
+        udp[0] = 0x45;
+        udp[9] = 17;
+        assert_eq!(ipv4_header_bytes(&udp), Some(28));
     }
 
     #[test]

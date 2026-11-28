@@ -100,6 +100,48 @@ struct ParentArgs {
     session_timeout_secs: u64,
     #[command(flatten)]
     stats: StatsArgs,
+    #[command(flatten)]
+    vsock: VsockArgs,
+}
+
+/// Size in bytes that the kernel gives the receive buffer of a new VSOCK stream
+/// (`VSOCK_DEFAULT_BUFFER_SIZE` in `net/vmw_vsock/af_vsock.c`).
+///
+/// `--vsock-buffer-bytes` accepts no smaller value, and `vsocktun` relies on that to never
+/// shrink a buffer: it does not read the size of a buffer before it sets it. On a kernel with
+/// a larger default, a value between this constant and that default would shrink the buffer.
+const VSOCK_DEFAULT_BUFFER_BYTES: u64 = 256 * 1024;
+
+/// Largest receive buffer that the VSOCK driver accepts (`VIRTIO_VSOCK_MAX_BUF_SIZE` in
+/// `include/linux/virtio_vsock.h`). The driver sets a larger request to this size without an
+/// error, so `--vsock-buffer-bytes` accepts no larger value.
+const VSOCK_MAX_BUFFER_BYTES: u64 = 0xFFFF_FFFF;
+
+/// Settings of the VSOCK streams. Each side of the tunnel sets its own.
+#[derive(Args, Debug, Clone, Default)]
+struct VsockArgs {
+    /// Raise the receive buffer of each shard stream to this many bytes (unset = the kernel
+    /// default, 256 KiB). The peer can have this many bytes on the way before it must wait.
+    /// A value below the kernel default is rejected: the option can only raise the buffer.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(VSOCK_DEFAULT_BUFFER_BYTES..=VSOCK_MAX_BUFFER_BYTES))]
+    vsock_buffer_bytes: Option<u64>,
+}
+
+impl VsockArgs {
+    /// Applies the settings to the shard streams of a new session.
+    ///
+    /// An error is a configuration error: the same settings fail on every session. The caller
+    /// must end the process and not retry.
+    fn apply(&self, role: &'static str, session: &SessionSockets) -> Result<()> {
+        if let Some(bytes) = self.vsock_buffer_bytes {
+            vsock::raise_receive_buffers(&session.shards, bytes)?;
+            tracing::info!(
+                bytes,
+                "vsocktun({role}): set the VSOCK receive buffer of each shard"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// How this process reports its packet counters. See [`stats`].
@@ -132,12 +174,14 @@ impl Drop for StatsReporter {
     }
 }
 
-/// Creates the counters of a tunnel with `queues` shards.
+/// Creates the counters of a tunnel with `queues` shards. The forwarding loops
+/// count packets only if `args` ask for reports.
 ///
 /// Leaks the counters. They must live as long as the process, and a plain
 /// reference keeps [`ShardLogContext`] `Copy`.
-fn new_tunnel_stats(queues: usize) -> &'static TunnelStats {
-    Box::leak(Box::new(TunnelStats::new(queues)))
+fn new_tunnel_stats(queues: usize, args: &StatsArgs) -> &'static TunnelStats {
+    let packet_counters = args.stats_interval_ms > 0;
+    Box::leak(Box::new(TunnelStats::new(queues, packet_counters)))
 }
 
 /// Enclave-side bootstrap parameters.
@@ -159,6 +203,8 @@ struct EnclaveArgs {
     reconnect_delay_ms: u64,
     #[command(flatten)]
     stats: StatsArgs,
+    #[command(flatten)]
+    vsock: VsockArgs,
 }
 
 struct WorkerOutcome<ReturnedQueue> {
@@ -226,7 +272,8 @@ struct ShardLogContext {
     role: &'static str,
     session_id: u64,
     shard: usize,
-    stats: &'static ShardStats,
+    /// The counters of the shard, or `None` when packets are not counted.
+    stats: Option<&'static ShardStats>,
 }
 
 impl ShardLogContext {
@@ -331,7 +378,7 @@ where
         tun_name = %common.tun_name,
         "vsocktun(parent): listening for tunnel sessions"
     );
-    let stats = new_tunnel_stats(tun.queue_count());
+    let stats = new_tunnel_stats(tun.queue_count(), &args.stats);
     let _stats_reporter = StatsReporter::start(stats, "parent", args.stats);
 
     tokio::pin!(shutdown);
@@ -346,6 +393,10 @@ where
                     shards = session.shards.len(),
                     "vsocktun(parent): established session"
                 );
+                // No retry: see `VsockArgs::apply`.
+                args.vsock
+                    .apply("parent", &session)
+                    .context("cannot apply the VSOCK settings; stopping the tunnel")?;
                 let session_result = tokio::select! {
                     _ = shutdown.as_mut() => return Ok(()),
                     result = run_session("parent", &tun, session, stats) => result,
@@ -450,7 +501,7 @@ where
     );
 
     let raw_tun_frames = tun.uses_vnet_hdr();
-    let stats = new_tunnel_stats(tun.queue_count());
+    let stats = new_tunnel_stats(tun.queue_count(), &args.stats);
     let _stats_reporter = StatsReporter::start(stats, "enclave", args.stats);
     loop {
         match tokio::select! {
@@ -463,6 +514,10 @@ where
                     shards = session.shards.len(),
                     "vsocktun(enclave): established session"
                 );
+                // No retry: see `VsockArgs::apply`.
+                args.vsock
+                    .apply("enclave", &session)
+                    .context("cannot apply the VSOCK settings; stopping the tunnel")?;
                 let session_result = tokio::select! {
                     _ = shutdown.as_mut() => return Ok(()),
                     result = run_session("enclave", &tun, session, stats) => result,
@@ -754,10 +809,8 @@ async fn forward_socket_to_tun(
         {
             let packet = frame_reader.current_payload();
             let mut pending_tun_write = PendingSliceWrite::new(packet);
-            // TODO: make the counters free when no reports are requested
-            // (`--stats-interval-ms 0`). The two clock reads for each packet,
-            // here and in `forward_tun_to_socket`, are their only real cost.
-            let write_started = Instant::now();
+            // The clock is read only for the counters.
+            let write_started = shard_log.stats.map(|_| Instant::now());
             let mut writes = 0;
             loop {
                 if *cancelled.borrow() {
@@ -779,12 +832,14 @@ async fn forward_socket_to_tun(
                 writes += 1;
 
                 if finished {
-                    shard_log.stats.vsock_to_tun.record_packet(
-                        packet_len,
-                        stats::segments_in_frame(packet, raw_tun_frames),
-                        writes,
-                        write_started.elapsed(),
-                    );
+                    if let (Some(stats), Some(write_started)) = (shard_log.stats, write_started) {
+                        stats.vsock_to_tun.record_packet(
+                            packet_len,
+                            stats::segments_in_frame(packet, raw_tun_frames),
+                            writes,
+                            write_started.elapsed(),
+                        );
+                    }
                     shard_log.trace(format_args!("forwarded {packet_len} bytes vsock->tun"));
                     #[cfg(test)]
                     test_support::record_test_vsock_to_tun(
@@ -843,8 +898,8 @@ async fn forward_tun_to_socket(
             format!("failed to frame TUN payload from queue {}", shard_log.shard)
         })?;
         let packet = &pending_socket_write.bytes()[FRAME_HEADER_BYTES..];
-        // TODO: see the TODO at the clock read in `forward_socket_to_tun`.
-        let write_started = Instant::now();
+        // The clock is read only for the counters.
+        let write_started = shard_log.stats.map(|_| Instant::now());
         let mut writes = 0;
         loop {
             if *cancelled.borrow() {
@@ -866,12 +921,14 @@ async fn forward_tun_to_socket(
             writes += 1;
 
             if finished {
-                shard_log.stats.tun_to_vsock.record_packet(
-                    packet_len,
-                    stats::segments_in_frame(packet, raw_tun_frames),
-                    writes,
-                    write_started.elapsed(),
-                );
+                if let (Some(stats), Some(write_started)) = (shard_log.stats, write_started) {
+                    stats.tun_to_vsock.record_packet(
+                        packet_len,
+                        stats::segments_in_frame(packet, raw_tun_frames),
+                        writes,
+                        write_started.elapsed(),
+                    );
+                }
                 shard_log.trace(format_args!("forwarded {packet_len} bytes tun->vsock"));
                 #[cfg(test)]
                 test_support::record_test_tun_to_vsock(
@@ -1363,7 +1420,8 @@ mod tests {
             reset_test_flow_counters, set_test_enclave_resolv_conf_target, test_flow_summary,
         };
         use super::super::{
-            EnclaveArgs, ParentArgs, ParentCommonArgs, StatsArgs, run_enclave, run_parent,
+            EnclaveArgs, ParentArgs, ParentCommonArgs, StatsArgs, VsockArgs, run_enclave,
+            run_parent,
         };
         use anyhow::{Context, Result, anyhow, bail};
         use etherparse::{NetSlice, SlicedPacket, TransportSlice};
@@ -1467,6 +1525,7 @@ mod tests {
                 },
                 session_timeout_secs: 5,
                 stats: StatsArgs::default(),
+                vsock: VsockArgs::default(),
             }
         }
 
@@ -1480,6 +1539,7 @@ mod tests {
                 parent_cid: 1,
                 reconnect_delay_ms: TEST_RETRY_DELAY.as_millis() as u64,
                 stats: StatsArgs::default(),
+                vsock: VsockArgs::default(),
             }
         }
 
@@ -2103,6 +2163,31 @@ mod tests {
             enclave(&["--stats-interval-ms", "1000"]).stats_interval_ms,
             1_000
         );
+    }
+
+    #[test]
+    fn vsock_buffer_option_only_accepts_a_raise() {
+        let parse = |value: &str| {
+            Cli::try_parse_from([
+                "vsocktun",
+                "enclave",
+                "--tun-name",
+                "vsocktun",
+                "--vsock-port",
+                "2100",
+                "--vsock-buffer-bytes",
+                value,
+            ])
+        };
+
+        match parse("4194304").expect("CLI should parse").mode {
+            Mode::Enclave(args) => assert_eq!(args.vsock.vsock_buffer_bytes, Some(4_194_304)),
+            Mode::Parent(_) => panic!("parsed the enclave command as parent"),
+        }
+        assert!(parse("262144").is_ok());
+        // Below the kernel default: the buffer would shrink.
+        assert!(parse("262143").is_err());
+        assert!(parse("1").is_err());
     }
 
     #[test]

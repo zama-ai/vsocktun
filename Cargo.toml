@@ -13,6 +13,7 @@ anyhow = "=1.0.100"  # Error handling - MEDIUM RISK: Reputable individual mainta
 bytemuck = { version = "=1.23.2", features = ["derive"] }  # Byte casting and plain-old-data derives - LOW RISK: Lokathor + community maintainers, widely used for zero-copy layout validation; used here only for fixed wire headers while preserving explicit endian conversion
 ciborium = "0.2.2" # CBOR support for serde - LOW RISK: Enarx team, 100M+ downloads
 clap = { version = "=4.5.47", features = ["derive"] }  # CLI argument parsing - LOW RISK: clap-rs team
+libc = "=0.2.186"  # C library bindings - LOW RISK: rust-lang project, already in the dependency tree through tokio and vsock; used to set the VSOCK buffer size with setsockopt, which the vsock crates do not expose
 route_manager = { version = "=0.2.11" }  # MEDIUM RISK: small focused networking crate already pulled transitively by tun-rs; used directly by vsocktun to install enclave routes without depending on extra runtime binaries in the enclave image
 tokio = { version = "=1.52.3", features = ["full"] }  # Async runtime - LOW RISK: tokio team, industry standard
 tokio-vsock = "=0.7.2"  # Async virtio socket support - MEDIUM RISK: same rust-vsock org/owners as vsock, 5M+ downloads

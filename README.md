@@ -102,6 +102,7 @@ vsocktun enclave \
 - `-v, --verbose`: raise log level from `info` to `debug`
 - `-vv`: raise log level to `trace` and include per-packet forwarding summaries
 - `--stats-interval-ms <N>` (both commands): log the packet counters every `N` ms as one `VSOCKTUN_STATS_V1` line at the `info` level. `0`, the default, means never.
+- `--vsock-buffer-bytes <N>` (both commands): raise the receive buffer of each shard stream to `N` bytes. When unset it uses the kernel default of 256 KiB.Each side sets its own buffer, so pass the option to both commands. An `N` below 262144 or above 4294967295 is rejected.
 
 Parent-only:
 - `--tun-address`: parent-side IPv4 address and prefix for the tunnel interface
@@ -219,12 +220,18 @@ verify the launcher contains the generated EIF. They don't boot an enclave.
 ## Packet counters
 
 With `--stats-interval-ms <N>`, each side logs one line every `N` ms at the
-`info` level. The line starts with `VSOCKTUN_STATS_V1`, then holds `key=value`
-pairs:
+`info` level. After the prefix of the log format, the line holds the marker
+`VSOCKTUN_STATS_V1` and then `key=value` pairs:
 
 ```
-VSOCKTUN_STATS_V1 role=enclave t_ms=1700000000000 shards=2 sessions=1 ... tun_to_vsock_packets=3 ...
+ INFO VSOCKTUN_STATS_V1 role=enclave t_ms=1700000000000 shards=2 sessions=1 ... tun_to_vsock_packets=3 ...
 ```
+
+A collector must search for the marker inside the line and must not expect it
+at the start. With colours on, the log prefix also holds escape codes.
+
+Without the option the forwarding loops do not count packets: they read no
+clock and update no counter.
 
 All values are running totals since the process started, unless the table says
 otherwise. They continue when the tunnel reconnects. To get a rate, subtract
@@ -255,7 +262,7 @@ table says otherwise.
 | `<dir>_writes` | Write calls that those packets needed. Equal to `<dir>_packets` when the destination takes each packet in one call. A higher value means that the destination took some packets in parts, because its buffer was almost full. |
 | `<dir>_write_us` | Time from the end of the read of a packet until the destination had accepted all of it, in microseconds, added up over the packets. It includes the write calls, the wait for the destination to accept data, and the wait of the task for a worker thread. It does not include the read, or the time the packet waited in a kernel queue before the read. |
 | `<dir>_large_packets` | Packets that carry more than one segment. See `<dir>_segments`. |
-| `<dir>_segments` | Segments that the packets carry: the number of packets that the same data needs on the wire. `vsocktun` reads it from the virtio-net header of each frame. Equal to `<dir>_packets` when the kernel batches nothing, and on a tunnel without raw TUN frames. |
+| `<dir>_segments` | Segments that the packets carry: the number of packets that the same data needs on the wire. `vsocktun` computes it for each frame from the segment size in the virtio-net header and from the lengths in the IPv4 and TCP or UDP headers. Equal to `<dir>_packets` when the kernel batches nothing, and on a tunnel without raw TUN frames. |
 | `<dir>_max_packet_bytes` | Size of the largest packet since the process started. Maximum over the shards. Not a sum. |
 | `<dir>_write_max_us` | Longest time of one packet, measured like `<dir>_write_us`, **since the previous line**. Maximum over the shards. Not a running total. |
 | `<dir>_packets_shard<i>` | `<dir>_packets` of shard `i` alone. |

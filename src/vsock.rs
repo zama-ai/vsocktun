@@ -12,11 +12,59 @@ use crate::protocol::{BootstrapRequest, BootstrapResponse, Hello, InitialRequest
 use crate::tun::Ipv4Cidr;
 use anyhow::{Context, Result, anyhow, bail};
 use std::fs;
+use std::io;
 use std::net::Ipv4Addr;
+use std::os::fd::AsRawFd;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncRead;
 use tokio::time::{Instant, timeout};
 use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener, VsockStream};
+
+// The buffer size options of a VSOCK socket (`include/uapi/linux/vm_sockets.h`). The buffer
+// holds the bytes that the peer sent and that this side did not read yet. Its size is the
+// credit of the peer: a sender waits when it has that many bytes on the way. The value of
+// each option is a `u64` in bytes.
+const SO_VM_SOCKETS_BUFFER_SIZE: libc::c_int = 0;
+const SO_VM_SOCKETS_BUFFER_MAX_SIZE: libc::c_int = 2;
+
+/// Sets a VSOCK buffer size option of `socket`.
+fn set_buffer_option(socket: &VsockStream, option: libc::c_int, bytes: u64) -> io::Result<()> {
+    // SAFETY: the file descriptor is open for the lifetime of `socket`. The value pointer is
+    // valid for reads of the length that is passed with it, and the kernel copies the value
+    // before the call returns.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::AF_VSOCK,
+            option,
+            (&raw const bytes).cast(),
+            size_of::<u64>() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Sets the receive buffer of each shard socket to `bytes`.
+///
+/// The caller must only raise a buffer. The peer can already have sent as many bytes as the
+/// current size allows, and the kernel drops received data that does not fit in a smaller
+/// buffer, which would damage the frame stream of the shard. The command line makes sure of
+/// this: it accepts no value below the size that the kernel gives a new socket.
+pub(crate) fn raise_receive_buffers(shards: &[VsockStream], bytes: u64) -> Result<()> {
+    for (shard, socket) in shards.iter().enumerate() {
+        // The maximum goes first: the kernel limits the size to it.
+        set_buffer_option(socket, SO_VM_SOCKETS_BUFFER_MAX_SIZE, bytes)
+            .and_then(|()| set_buffer_option(socket, SO_VM_SOCKETS_BUFFER_SIZE, bytes))
+            .with_context(|| {
+                format!("failed to set the VSOCK buffer of shard {shard} to {bytes} bytes")
+            })?;
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 enum SessionShard<T> {
