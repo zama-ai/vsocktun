@@ -101,6 +101,7 @@ vsocktun enclave \
   drive all shard tasks in the process
 - `-v, --verbose`: raise log level from `info` to `debug`
 - `-vv`: raise log level to `trace` and include per-packet forwarding summaries
+- `--stats-interval-ms <N>` (both commands): log the packet counters every `N` ms as one `VSOCKTUN_STATS_V1` line at the `info` level. `0`, the default, means never.
 
 Parent-only:
 - `--tun-address`: parent-side IPv4 address and prefix for the tunnel interface
@@ -214,6 +215,65 @@ nix build --builders '' --no-link \
 
 The checks inspect both archives, check representative ELF binaries, and
 verify the launcher contains the generated EIF. They don't boot an enclave.
+
+## Packet counters
+
+With `--stats-interval-ms <N>`, each side logs one line every `N` ms at the
+`info` level. The line starts with `VSOCKTUN_STATS_V1`, then holds `key=value`
+pairs:
+
+```
+VSOCKTUN_STATS_V1 role=enclave t_ms=1700000000000 shards=2 sessions=1 ... tun_to_vsock_packets=3 ...
+```
+
+All values are running totals since the process started, unless the table says
+otherwise. They continue when the tunnel reconnects. To get a rate, subtract
+the values of two lines and divide by the difference of their `t_ms`.
+
+Values for the process:
+
+| Key | Meaning |
+| --- | --- |
+| `role` | `parent` or `enclave`: the side that wrote the line. |
+| `t_ms` | Wall clock of that side when it wrote the line, in milliseconds since the Unix epoch. |
+| `shards` | Number of shards. Constant. |
+| `sessions` | Sessions established. 1 in a healthy run; each reconnect adds 1. |
+| `session_errors` | Sessions that ended with an error. |
+| `connect_failures` | Attempts to connect (enclave) or accept (parent) a session that produced none. |
+| `cpu_user_ms`, `cpu_system_ms` | CPU time of the `vsocktun` process in user mode and in the kernel, from `/proc/self/stat`. Absent where that file does not exist. |
+
+Values for each direction. `<dir>` is `tun_to_vsock` (read from the TUN queue,
+written to the VSOCK stream) or `vsock_to_tun` (the reverse). In the enclave,
+`tun_to_vsock` is traffic that leaves the enclave. On the parent it is traffic
+that goes into the enclave. Each value is the sum over all shards, unless the
+table says otherwise.
+
+| Key | Meaning |
+| --- | --- |
+| `<dir>_packets` | Packets forwarded. A packet counts when the destination has accepted its last byte. With raw TUN frames, one packet can carry several TCP segments. |
+| `<dir>_bytes` | Bytes of those packets as read from the source, without the 4-byte length that `vsocktun` adds on the VSOCK stream. |
+| `<dir>_writes` | Write calls that those packets needed. Equal to `<dir>_packets` when the destination takes each packet in one call. A higher value means that the destination took some packets in parts, because its buffer was almost full. |
+| `<dir>_write_us` | Time from the end of the read of a packet until the destination had accepted all of it, in microseconds, added up over the packets. It includes the write calls, the wait for the destination to accept data, and the wait of the task for a worker thread. It does not include the read, or the time the packet waited in a kernel queue before the read. |
+| `<dir>_large_packets` | Packets that carry more than one segment. See `<dir>_segments`. |
+| `<dir>_segments` | Segments that the packets carry: the number of packets that the same data needs on the wire. `vsocktun` reads it from the virtio-net header of each frame. Equal to `<dir>_packets` when the kernel batches nothing, and on a tunnel without raw TUN frames. |
+| `<dir>_max_packet_bytes` | Size of the largest packet since the process started. Maximum over the shards. Not a sum. |
+| `<dir>_write_max_us` | Longest time of one packet, measured like `<dir>_write_us`, **since the previous line**. Maximum over the shards. Not a running total. |
+| `<dir>_packets_shard<i>` | `<dir>_packets` of shard `i` alone. |
+| `<dir>_write_us_shard<i>` | `<dir>_write_us` of shard `i` alone. |
+
+Useful ratios:
+
+- `<dir>_bytes / <dir>_packets`: mean packet size.
+- `<dir>_segments / <dir>_packets`: how many segments the kernel batches into one packet.
+- `<dir>_write_us / <dir>_packets`: mean time that `vsocktun` holds a packet.
+- `<dir>_writes - <dir>_packets`: number of partial writes.
+
+`vsocktun` does not drop packets, and it holds one packet for each shard and
+direction. So it has no drop or queue-length counters. The kernel drops packets
+when a TUN queue is full, and the drop counters of the TUN interface show that.
+
+The counters cost two clock reads for each packet, also when no lines are
+logged.
 
 ## Debugging
 

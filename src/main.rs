@@ -12,6 +12,7 @@
 //!   transport
 
 mod protocol;
+mod stats;
 mod tun;
 mod vsock;
 
@@ -19,6 +20,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use protocol::{FrameReader, PendingFramedWrite, PendingSliceWrite};
 use route_manager::{Route, RouteManager};
+use stats::{ShardStats, TunnelStats};
 use std::fmt::Arguments;
 use std::fs;
 use std::future::Future;
@@ -29,7 +31,7 @@ use std::process;
 use tokio::runtime::Builder;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Duration, Instant, sleep, timeout};
 use tokio_vsock::{OwnedReadHalf, OwnedWriteHalf, VsockStream};
 use tracing::Level;
 use tun::{Ipv4Cidr, TunDevice};
@@ -96,6 +98,46 @@ struct ParentArgs {
     common: ParentCommonArgs,
     #[arg(long, default_value_t = 5)]
     session_timeout_secs: u64,
+    #[command(flatten)]
+    stats: StatsArgs,
+}
+
+/// How this process reports its packet counters. See [`stats`].
+#[derive(Args, Debug, Clone, Default)]
+struct StatsArgs {
+    /// Log the packet counters at this interval in milliseconds (0 = never)
+    #[arg(long, default_value_t = 0)]
+    stats_interval_ms: u64,
+}
+
+/// Stops the stats reports when dropped, so that they end with the tunnel.
+struct StatsReporter(Option<tokio::task::JoinHandle<()>>);
+
+impl StatsReporter {
+    /// Starts the reports of `stats` if `args` ask for them.
+    fn start(stats: &'static TunnelStats, role: &'static str, args: StatsArgs) -> Self {
+        if args.stats_interval_ms == 0 {
+            return Self(None);
+        }
+        let interval = Duration::from_millis(args.stats_interval_ms);
+        Self(Some(tokio::spawn(stats::report(stats, role, interval))))
+    }
+}
+
+impl Drop for StatsReporter {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// Creates the counters of a tunnel with `queues` shards.
+///
+/// Leaks the counters. They must live as long as the process, and a plain
+/// reference keeps [`ShardLogContext`] `Copy`.
+fn new_tunnel_stats(queues: usize) -> &'static TunnelStats {
+    Box::leak(Box::new(TunnelStats::new(queues)))
 }
 
 /// Enclave-side bootstrap parameters.
@@ -115,6 +157,8 @@ struct EnclaveArgs {
     parent_cid: u32,
     #[arg(long, default_value_t = 1_000)]
     reconnect_delay_ms: u64,
+    #[command(flatten)]
+    stats: StatsArgs,
 }
 
 struct WorkerOutcome<ReturnedQueue> {
@@ -182,6 +226,7 @@ struct ShardLogContext {
     role: &'static str,
     session_id: u64,
     shard: usize,
+    stats: &'static ShardStats,
 }
 
 impl ShardLogContext {
@@ -286,6 +331,8 @@ where
         tun_name = %common.tun_name,
         "vsocktun(parent): listening for tunnel sessions"
     );
+    let stats = new_tunnel_stats(tun.queue_count());
+    let _stats_reporter = StatsReporter::start(stats, "parent", args.stats);
 
     tokio::pin!(shutdown);
     loop {
@@ -301,13 +348,15 @@ where
                 );
                 let session_result = tokio::select! {
                     _ = shutdown.as_mut() => return Ok(()),
-                    result = run_session("parent", &tun, session) => result,
+                    result = run_session("parent", &tun, session, stats) => result,
                 };
                 if let Err(err) = session_result {
+                    stats.record_session_error();
                     tracing::error!(error = %err, "vsocktun(parent): session ended with error");
                 }
             }
             Err(err) => {
+                stats.record_connect_failure();
                 tracing::error!(error = %err, "vsocktun(parent): failed to accept session");
             }
         }
@@ -401,6 +450,8 @@ where
     );
 
     let raw_tun_frames = tun.uses_vnet_hdr();
+    let stats = new_tunnel_stats(tun.queue_count());
+    let _stats_reporter = StatsReporter::start(stats, "enclave", args.stats);
     loop {
         match tokio::select! {
             _ = shutdown.as_mut() => return Ok(()),
@@ -414,13 +465,15 @@ where
                 );
                 let session_result = tokio::select! {
                     _ = shutdown.as_mut() => return Ok(()),
-                    result = run_session("enclave", &tun, session) => result,
+                    result = run_session("enclave", &tun, session, stats) => result,
                 };
                 if let Err(err) = session_result {
+                    stats.record_session_error();
                     tracing::error!(error = %err, "vsocktun(enclave): session ended with error");
                 }
             }
             Err(err) => {
+                stats.record_connect_failure();
                 tracing::error!(error = %err, "vsocktun(enclave): failed to connect session");
             }
         }
@@ -439,7 +492,12 @@ where
 ///
 /// A session supervisor fans out one worker per shard, waits for the first
 /// failure, and then broadcasts cancellation so no shard outlives the session.
-async fn run_session(role: &'static str, tun: &TunDevice, session: SessionSockets) -> Result<()> {
+async fn run_session(
+    role: &'static str,
+    tun: &TunDevice,
+    session: SessionSockets,
+    stats: &'static TunnelStats,
+) -> Result<()> {
     let session_id = session.session_id;
     let max_tun_frame_bytes = tun.max_frame_bytes();
     let mut tun_queues = tun
@@ -462,11 +520,13 @@ async fn run_session(role: &'static str, tun: &TunDevice, session: SessionSocket
         "vsocktun: starting session"
     );
 
+    stats.record_session();
     let work_items = tun_queues.drain(..).zip(session.shards).collect::<Vec<_>>();
     let SupervisedWorkersOutcome {
         returned_queues,
         result,
-    } = supervise_tun_session_workers(role, session_id, work_items, max_tun_frame_bytes).await;
+    } = supervise_tun_session_workers(role, session_id, work_items, max_tun_frame_bytes, stats)
+        .await;
 
     let restored_queues = returned_queues
         .into_iter()
@@ -489,6 +549,7 @@ async fn supervise_tun_session_workers(
     session_id: u64,
     work_items: Vec<(AsyncDevice, VsockStream)>,
     max_tun_frame_bytes: usize,
+    stats: &'static TunnelStats,
 ) -> SupervisedWorkersOutcome<AsyncDevice> {
     let (cancel_tx, _) = watch::channel(false);
     let (return_tx, mut return_rx) = mpsc::unbounded_channel();
@@ -505,6 +566,7 @@ async fn supervise_tun_session_workers(
             role,
             session_id,
             shard,
+            stats: stats.shard(shard),
         };
         tasks.spawn(async move {
             let mut queue_guard = QueueReturnGuard::new(shard, tun_queue, return_tx);
@@ -665,7 +727,6 @@ async fn forward_socket_to_tun(
     mut cancelled: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut frame_reader = FrameReader::new(max_tun_frame_bytes);
-    #[cfg(test)]
     let raw_tun_frames = tun_queue.tcp_gso();
 
     loop {
@@ -693,6 +754,11 @@ async fn forward_socket_to_tun(
         {
             let packet = frame_reader.current_payload();
             let mut pending_tun_write = PendingSliceWrite::new(packet);
+            // TODO: make the counters free when no reports are requested
+            // (`--stats-interval-ms 0`). The two clock reads for each packet,
+            // here and in `forward_tun_to_socket`, are their only real cost.
+            let write_started = Instant::now();
+            let mut writes = 0;
             loop {
                 if *cancelled.borrow() {
                     return Ok(());
@@ -710,8 +776,15 @@ async fn forward_socket_to_tun(
                         result.with_context(|| format!("failed to inject packet into TUN queue {}", shard_log.shard))?
                     }
                 };
+                writes += 1;
 
                 if finished {
+                    shard_log.stats.vsock_to_tun.record_packet(
+                        packet_len,
+                        stats::segments_in_frame(packet, raw_tun_frames),
+                        writes,
+                        write_started.elapsed(),
+                    );
                     shard_log.trace(format_args!("forwarded {packet_len} bytes vsock->tun"));
                     #[cfg(test)]
                     test_support::record_test_vsock_to_tun(
@@ -738,7 +811,6 @@ async fn forward_tun_to_socket(
     max_tun_frame_bytes: usize,
     mut cancelled: watch::Receiver<bool>,
 ) -> Result<()> {
-    #[cfg(test)]
     let raw_tun_frames = tun_queue.tcp_gso();
     let mut tun_buf = vec![0_u8; max_tun_frame_bytes];
 
@@ -768,6 +840,9 @@ async fn forward_tun_to_socket(
         let mut pending_socket_write = PendingFramedWrite::new(packet).with_context(|| {
             format!("failed to frame TUN payload from queue {}", shard_log.shard)
         })?;
+        // TODO: see the TODO at the clock read in `forward_socket_to_tun`.
+        let write_started = Instant::now();
+        let mut writes = 0;
         loop {
             if *cancelled.borrow() {
                 return Ok(());
@@ -785,8 +860,15 @@ async fn forward_tun_to_socket(
                     result.with_context(|| format!("failed to forward packet on VSOCK shard {}", shard_log.shard))?
                 }
             };
+            writes += 1;
 
             if finished {
+                shard_log.stats.tun_to_vsock.record_packet(
+                    packet_len,
+                    stats::segments_in_frame(packet, raw_tun_frames),
+                    writes,
+                    write_started.elapsed(),
+                );
                 shard_log.trace(format_args!("forwarded {packet_len} bytes tun->vsock"));
                 #[cfg(test)]
                 test_support::record_test_tun_to_vsock(
@@ -1277,7 +1359,9 @@ mod tests {
         use super::super::test_support::{
             reset_test_flow_counters, set_test_enclave_resolv_conf_target, test_flow_summary,
         };
-        use super::super::{EnclaveArgs, ParentArgs, ParentCommonArgs, run_enclave, run_parent};
+        use super::super::{
+            EnclaveArgs, ParentArgs, ParentCommonArgs, StatsArgs, run_enclave, run_parent,
+        };
         use anyhow::{Context, Result, anyhow, bail};
         use etherparse::{NetSlice, SlicedPacket, TransportSlice};
         use netns_rs::NetNs;
@@ -1379,6 +1463,7 @@ mod tests {
                     tokio_worker_threads: 1,
                 },
                 session_timeout_secs: 5,
+                stats: StatsArgs::default(),
             }
         }
 
@@ -1391,6 +1476,7 @@ mod tests {
                 // the same host after entering the enclave network namespace.
                 parent_cid: 1,
                 reconnect_delay_ms: TEST_RETRY_DELAY.as_millis() as u64,
+                stats: StatsArgs::default(),
             }
         }
 
@@ -1989,6 +2075,31 @@ mod tests {
 
         assert_eq!(cli.verbose, 2);
         assert!(matches!(cli.mode, Mode::Enclave(_)));
+    }
+
+    #[test]
+    fn stats_reports_are_off_unless_asked_for() {
+        let enclave = |extra: &[&str]| {
+            let mut args = vec![
+                "vsocktun",
+                "enclave",
+                "--tun-name",
+                "vsocktun",
+                "--vsock-port",
+                "2100",
+            ];
+            args.extend_from_slice(extra);
+            match Cli::try_parse_from(args).expect("CLI should parse").mode {
+                Mode::Enclave(args) => args.stats,
+                Mode::Parent(_) => panic!("parsed the enclave command as parent"),
+            }
+        };
+
+        assert_eq!(enclave(&[]).stats_interval_ms, 0);
+        assert_eq!(
+            enclave(&["--stats-interval-ms", "1000"]).stats_interval_ms,
+            1_000
+        );
     }
 
     #[test]
